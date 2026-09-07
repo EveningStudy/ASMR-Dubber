@@ -21,11 +21,15 @@ https://github.com/user-attachments/assets/d7106c36-8a5d-4aab-96b3-0f17d027d0d3
 
 Windows 从 [GitHub Releases](https://github.com/EveningStudy/asmr-dubber/releases/latest) 下载便携 ZIP，完整解压到短且可写的路径，例如 `D:\Apps\ASMR-Dubber`：
 
+> **使用前请启用 Windows 长路径。** 如果你的 Windows 设置中提供此开关，进入“设置 → 系统 → 高级 → 文件资源管理器”，打开“启用长路径”，然后重新启动 ASMR Dubber。未启用时，IndexTTS2 等第三方运行环境中的深层文件可能超过 Windows 的传统路径限制，出现“文件明明存在但程序报告找不到”的错误。如果当前 Windows 没有这个开关，请优先把程序解压到 `D:\ASMR-Dubber` 这类短路径，以降低路径过长的风险。
+
+![Windows“启用长路径”开关位置](assets/windows-enable-long-paths.png)
+
 1. 首次运行 `ASMR-Dubber-Setup.exe`，选择安装方案。
 2. 安装完成后运行 `ASMR-Dubber.exe`，保留启动终端。
 3. 在“设置 → 设备与模型”检查后端，再配置识别、翻译和配音。
 
-不要求预装 Python、uv、Git、FFmpeg 或 CUDA Toolkit。下载需要系统 `curl.exe`；本地 GPU 推理需要兼容的 NVIDIA 驱动。长路径设置、SmartScreen、显存要求及安装失败处理见[安装指南](docs/INSTALLATION.md)。
+不要求预装 Python、uv、Git、FFmpeg 或 CUDA Toolkit。下载需要系统 `curl.exe`；本地 GPU 推理需要兼容的 NVIDIA 驱动。SmartScreen、显存要求及安装失败处理见[安装指南](docs/INSTALLATION.md)。
 
 Linux x86_64（含 WSL2）在源码根目录执行：
 
