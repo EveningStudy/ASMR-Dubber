@@ -14,7 +14,11 @@ def inventory(wheelhouse: Path) -> list[dict[str, object]]:
     records = []
     for wheel in sorted(wheelhouse.glob("*.whl")):
         with zipfile.ZipFile(wheel) as archive:
-            members = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+            members = [
+                name
+                for name in archive.namelist()
+                if name.endswith(".dist-info/METADATA") and name.count("/") == 1
+            ]
             if len(members) != 1:
                 raise ValueError(f"Invalid wheel metadata: {wheel.name}")
             metadata = BytesParser().parsebytes(archive.read(members[0]))

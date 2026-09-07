@@ -15,6 +15,10 @@ def test_inventory_records_actual_wheels_and_hashes(tmp_path):
             "example-1.0.dist-info/METADATA",
             "Name: example\nVersion: 1.0\nLicense-Expression: MIT\nRequires-Dist: other>=1\n",
         )
+        archive.writestr(
+            "example/_vendor/other-2.0.dist-info/METADATA",
+            "Name: other\nVersion: 2.0\n",
+        )
     records = module.inventory(tmp_path)
     assert len(records) == 1
     assert records[0]["name"] == "example"
