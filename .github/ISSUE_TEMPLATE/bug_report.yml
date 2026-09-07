@@ -11,7 +11,7 @@ body:
     id: version
     attributes:
       label: 版本/提交
-      placeholder: 0.6.1 或 git commit
+      placeholder: 发行版号，或 commit + 是否含未提交修改
     validations:
       required: true
   - type: dropdown
@@ -44,7 +44,7 @@ body:
     id: steps
     attributes:
       label: 复现步骤
-      description: 从干净启动开始列出最短步骤。
+      description: 列出最短步骤；保存问题注明保存范围、成功提示、刷新页面还是重启程序；卡顿注明句数和音频时长。
     validations:
       required: true
   - type: textarea

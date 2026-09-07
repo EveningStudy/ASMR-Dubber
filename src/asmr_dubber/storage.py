@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -13,12 +14,52 @@ from .errors import ProjectError
 _LOCKS_GUARD = threading.Lock()
 _PROCESS_LOCKS: dict[Path, threading.RLock] = {}
 _THREAD_STATE = threading.local()
+_WINDOWS_REPLACE_RETRY_SECONDS = 2.0
+_WINDOWS_REPLACE_RETRY_ERRORS = {5, 32, 33}
+
+
+def require_disk_space(directory: Path, required_bytes: int) -> None:
+    ancestor = directory.resolve()
+    while not ancestor.exists() and ancestor != ancestor.parent:
+        ancestor = ancestor.parent
+    required = max(0, required_bytes) + 64 * 1024**2
+    free = shutil.disk_usage(ancestor).free
+    if free < required:
+        raise ProjectError(
+            f"磁盘空间不足：需至少 {required / 1024**3:.2f} GiB，可用 {free / 1024**3:.2f} GiB。"
+        )
 
 
 def _process_lock(path: Path) -> threading.RLock:
     resolved = path.resolve()
     with _LOCKS_GUARD:
         return _PROCESS_LOCKS.setdefault(resolved, threading.RLock())
+
+
+def _is_transient_windows_replace_error(exc: OSError) -> bool:
+    return os.name == "nt" and getattr(exc, "winerror", None) in _WINDOWS_REPLACE_RETRY_ERRORS
+
+
+def _replace_with_retry(temporary: Path, destination: Path) -> None:
+    """Replace a file atomically, tolerating short-lived Windows readers."""
+
+    deadline = time.monotonic() + _WINDOWS_REPLACE_RETRY_SECONDS
+    delay = 0.02
+    while True:
+        try:
+            os.replace(temporary, destination)
+            return
+        except OSError as exc:
+            if not _is_transient_windows_replace_error(exc):
+                raise
+            if time.monotonic() >= deadline:
+                raise ProjectError(
+                    f"Windows 无法更新文件：{destination}。文件可能正被其他窗口、"
+                    "杀毒软件或同步程序占用，或者被设为只读。请关闭占用后重试；"
+                    "原文件没有被破坏。"
+                ) from exc
+            time.sleep(delay)
+            delay = min(delay * 2, 0.25)
 
 
 @contextmanager
@@ -109,7 +150,7 @@ def atomic_write_text(
             os.fsync(handle.fileno())
         if mode is not None and os.name != "nt":
             temporary.chmod(mode)
-        os.replace(temporary, destination)
+        _replace_with_retry(temporary, destination)
         if mode is not None and os.name != "nt":
             destination.chmod(mode)
         if os.name != "nt":

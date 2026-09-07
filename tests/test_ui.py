@@ -10,7 +10,14 @@ import soundfile as sf
 import asmr_dubber.ui as ui_module
 from asmr_dubber.audio import sha256_file
 from asmr_dubber.constants import INDEXTTS_REQUIRED_DIRS, INDEXTTS_REQUIRED_FILES
-from asmr_dubber.models import AudioInfo, DubProject, Sentence, load_project, save_project
+from asmr_dubber.models import (
+    AudioInfo,
+    DubProject,
+    ProjectSettings,
+    Sentence,
+    load_project,
+    save_project,
+)
 from asmr_dubber.runtime_manager import BackendStatus
 from asmr_dubber.translation import SYSTEM_PROMPT, default_translation_prompt
 from asmr_dubber.ui import (
@@ -353,7 +360,7 @@ def test_ui_exposes_clear_five_step_workflow_and_only_supported_backends(app) ->
     assert "默认成品组织" in labels
     assert "打开项目目录" in values
     assert "打开 output 文件夹" in values
-    assert any("多模型结果可能不如单模型" in str(value) for value in values)
+    assert any("多模型可能不如单模型" in str(value) for value in values)
     autoflow_log = next(
         component
         for component in app.blocks.values()
@@ -379,6 +386,7 @@ def test_ui_exposes_clear_five_step_workflow_and_only_supported_backends(app) ->
         "粘贴纯文本",
         "纯文本台本的处理方式",
         "导入内容",
+        None,  # Per-browser project revision.
     ]
 
     explained_advanced_labels = {
@@ -682,9 +690,9 @@ def test_project_action_error_preserves_values_and_updates_status(app) -> None:
         function.fn for function in app.fns.values() if function.name == "subtitle_callback"
     )
 
-    result = callback("", [], "zh")
+    result = callback("", [], "zh", None)
 
-    assert len(result) == 12
+    assert len(result) == 13
     assert all(value == {"__type__": "update"} for value in result[:9])
     assert "当前项目、表格和已有输出均已保留" in result[9]
     assert result[10] == {"__type__": "update"}
@@ -759,19 +767,51 @@ def test_tts_and_mix_services_are_independent(tmp_path: Path, monkeypatch) -> No
     assert calls == ["mix"]
 
 
+def test_mix_service_renders_the_persisted_output_state(tmp_path: Path, monkeypatch) -> None:
+    project, manifest = _project(tmp_path / "project")
+    persisted = project.model_copy(deep=True)
+    output_dir = manifest.parent / "output"
+    output_dir.mkdir()
+    mixed = output_dir / "mixed.wav"
+    stem = output_dir / "stem.wav"
+    mixed.write_bytes(b"mixed")
+    stem.write_bytes(b"stem")
+    persisted.settings.mix_output_mode = "both"
+    persisted.output_file = "output/mixed.wav"
+    persisted.chinese_stem_file = "output/stem.wav"
+    reloads = iter(((project, manifest.parent), (persisted, manifest.parent)))
+
+    monkeypatch.setattr(
+        "asmr_dubber.ui_services.pipeline.reload_project",
+        lambda _path: next(reloads),
+    )
+    monkeypatch.setattr("asmr_dubber.ui_services.apply_table", lambda *_args: False)
+    monkeypatch.setattr(
+        "asmr_dubber.ui_services.pipeline.mix_project",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = mix_service(str(manifest), [])
+
+    assert result.output_audio is not None
+    assert result.stem_audio is not None
+    assert "混音成品和中文克隆音轨" in result.status
+
+
 def test_apply_settings_button_saves_defaults_and_updates_both_pages(app, monkeypatch) -> None:
     function = next(
         function for function in app.fns.values() if function.name == "apply_settings_callback"
     )
-    assert len(function.outputs) == 16
+    assert len(function.outputs) == 17
     assert function.outputs[0].label == "设置状态"
 
     values = [getattr(component, "value", None) for component in function.inputs]
     values[0] = r"D:\projects\current\project.json"
+    values[2] = "both"
     review_index = next(
         index
         for index, component in enumerate(function.inputs)
-        if component.label == "启用多 ASR（语音识别）+ 大模型交叉校对"
+        if component.label == "启用统一音频片段复核"
     )
     values[review_index] = False
     autoflow_mode_index = next(
@@ -814,7 +854,7 @@ def test_apply_settings_button_saves_defaults_and_updates_both_pages(app, monkey
         "manifest": r"D:\projects\current\project.json",
         "applied": False,
     }
-    assert len(result) == 16
+    assert len(result) == 17
     assert "设置已保存" in result[0]
     assert "多模型交叉校对=关闭" in result[0]
     assert "多模型交叉校对=关闭" in result[10]
@@ -826,7 +866,121 @@ def test_apply_settings_button_saves_defaults_and_updates_both_pages(app, monkey
     assert captured == {"saved": False}
     assert "以后新建的项目将使用这些设置" in without_project[0]
     assert without_project[1]["__type__"] == "update"
-    assert "以后新建的项目" in without_project[13]
+    assert "以后新建的项目" in without_project[14]
+
+
+def test_tts_settings_tab_reloads_the_current_project_backend(app, monkeypatch) -> None:
+    functions = [
+        function for function in app.fns.values() if function.name == "refresh_tts_form_callback"
+    ]
+    assert len(functions) == 2  # Page load + explicit load; never reset a draft on tab selection.
+    settings = ProjectSettings()
+    settings.tts_backend = "indextts2_5"
+    settings.tts_model = "IndexTTS-2.5"
+    settings.tts_device = "cuda"
+    monkeypatch.setattr(
+        ui_module,
+        "_settings_in_effect",
+        lambda _manifest: (settings, "当前项目"),
+    )
+
+    function = functions[0]
+    result = function.fn("project.json")
+    backend_index = next(
+        index
+        for index, component in enumerate(function.outputs)
+        if component.label == "TTS（语音合成）后端"
+    )
+    model_index = next(
+        index
+        for index, component in enumerate(function.outputs)
+        if component.label == "TTS（语音合成）模型"
+    )
+
+    assert "当前项目" in result[0]
+    assert result[backend_index]["value"] == "indextts2_5"
+    assert result[model_index]["value"] == "IndexTTS-2.5"
+    assert "IndexTTS-2.5" in result[-1]
+
+
+def test_tts_hydration_reads_current_disk_not_startup_values(app, monkeypatch):
+    functions = [f for f in app.fns.values() if f.name == "refresh_tts_form_callback"]
+    current = ProjectSettings(tts_backend="indextts2_5", tts_model="IndexTTS-2.5")
+    monkeypatch.setattr(ui_module, "_settings_in_effect", lambda _: (current, "以后新建的项目"))
+    fn = functions[0]
+    index = next(i for i, c in enumerate(fn.outputs) if c.label == "TTS（语音合成）后端")
+    assert fn.fn("")[index]["value"] == "indextts2_5"
+    current.tts_backend = "indextts2"
+    current.tts_model = "IndexTTS2"
+    assert fn.fn("")[index]["value"] == "indextts2"
+
+
+def test_tts_programmatic_updates_do_not_replace_saved_values(monkeypatch):
+    monkeypatch.setattr(
+        ui_module, "detect_hardware", lambda: SimpleNamespace(recommended_device="cuda")
+    )
+    monkeypatch.setattr(ui_module, "service_key_status", lambda *a: "")
+    updates = ui_module._tts_backend_visibility_update("indextts2")
+    assert all("value" not in item for item in updates if isinstance(item, dict))
+
+
+def test_local_tts_save_uses_selected_backend_even_if_model_event_is_pending(monkeypatch):
+    monkeypatch.setattr(ui_module, "load_user_settings", UserSettings)
+    settings = ui_module._settings_from_form(
+        ["tts_backend", "tts_model"], ["indextts2", "IndexTTS-2.5"], None, None
+    )
+    assert settings.tts_backend == "indextts2" and settings.tts_model == "IndexTTS2"
+
+
+def test_settings_default_scope_preserves_current_project(app, monkeypatch):
+    fn = next(f for f in app.fns.values() if f.name == "apply_settings_callback")
+    values = [getattr(component, "value", None) for component in fn.inputs]
+    values[0] = "existing-project.json"
+    values[2] = "defaults"
+    monkeypatch.setattr(ui_module, "load_user_settings", UserSettings)
+    monkeypatch.setattr(ui_module, "save_user_settings", lambda _: Path("settings.json"))
+    monkeypatch.setattr(
+        ui_module,
+        "apply_global_settings",
+        lambda *a: pytest.fail("must not modify current project"),
+    )
+    result = fn.fn(*values)
+    assert result[3] == {"__type__": "update"}
+    assert "以后新建" in result[0]
+
+
+def test_workflow_controls_follow_prerequisites(app):
+    fn = next(f.fn for f in app.fns.values() if f.name == "workflow_availability")
+    assert not any(item["interactive"] for item in fn("", []))
+    assert [item["interactive"] for item in fn("project.json", [])] == [
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
+    assert all(
+        item["interactive"] for item in fn("project.json", [["s1", True, 0, 1, "source", "中文"]])
+    )
+    assert not fn("project.json", [["s1", "false", "0", "1", "source", "中文"]])[3]["interactive"]
+
+
+def test_sentence_table_avoids_mixed_datatype_reactive_loop(app):
+    table = next(
+        component
+        for component in app.blocks.values()
+        if getattr(component, "label", None) == "句子校对表格"
+    )
+    assert table.datatype == "str"
+    assert table.type == "array"
+    assert table.wrap is False
+    assert table.max_chars == 160
+
+
+def test_review_feature_and_result_panel_have_explicit_experimental_warning(app):
+    messages = [str(getattr(component, "value", "")) for component in app.blocks.values()]
+    assert sum("实验性，效果可能不如单模型" in message for message in messages) >= 2
+    assert any("普通单模型识别不需要使用" in message for message in messages)
 
 
 def test_backend_usage_distinguishes_current_project_from_pending_form(
@@ -1018,16 +1172,38 @@ def test_tts_detail_visibility_tracks_active_reference_mode() -> None:
         "zero_shot",
     )
 
-    assert [update["visible"] for update in gpt_external] == [True, True, True, False, False]
+    assert [update["visible"] for update in gpt_external] == [
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
     assert [update["visible"] for update in cosy_cross_lingual] == [
         True,
         False,
         False,
         False,
         False,
+        False,
     ]
-    assert [update["visible"] for update in index_external] == [True, False, False, True, False]
-    assert [update["visible"] for update in index_text] == [False, False, False, False, True]
+    assert [update["visible"] for update in index_external] == [
+        True,
+        False,
+        False,
+        True,
+        False,
+        False,
+    ]
+    assert [update["visible"] for update in index_text] == [
+        False,
+        False,
+        False,
+        False,
+        True,
+        False,
+    ]
 
     mimo_clone = ui_module._tts_detail_visibility(
         "mimo_tts",
@@ -1045,8 +1221,15 @@ def test_tts_detail_visibility_tracks_active_reference_mode() -> None:
         "sentence_reference",
         "zero_shot",
     )
-    assert [update["visible"] for update in mimo_clone] == [True, False, False, False, False]
-    assert [update["visible"] for update in mimo_preset] == [False] * 5
+    assert [update["visible"] for update in mimo_clone] == [
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+    ]
+    assert [update["visible"] for update in mimo_preset] == [False] * 6
 
 
 def test_new_tts_backend_controls_only_show_relevant_options(monkeypatch) -> None:
@@ -1062,28 +1245,29 @@ def test_new_tts_backend_controls_only_show_relevant_options(monkeypatch) -> Non
     mimo = ui_module._tts_backend_update("mimo_tts")
     minimax = ui_module._tts_backend_update("minimax")
 
-    assert index[8]["value"] == "cuda"
-    assert index[8]["visible"] is True
-    assert edge[8]["value"] == "cpu"
-    assert edge[8]["visible"] is False
+    assert index[10]["value"] == "cuda"
+    assert index[10]["visible"] is True
+    assert edge[10]["value"] == "cpu"
+    assert edge[10]["visible"] is False
     assert edge[0]["value"] == "edge-tts"
     assert edge[1]["value"] == ""
     assert edge[5]["visible"] is False
-    assert edge[11]["visible"] is True
-    assert edge[12]["value"] == "zh-CN-XiaoxiaoNeural"
+    assert edge[7]["visible"] is False
     assert edge[13]["visible"] is True
-    assert edge[14]["visible"] is False
-    assert edge[15]["visible"] is False
+    assert edge[14]["value"] == "zh-CN-XiaoxiaoNeural"
+    assert edge[15]["visible"] is True
+    assert edge[16]["visible"] is False
+    assert edge[17]["visible"] is False
 
     assert mimo[0]["value"] == "mimo-v2.5-tts-voiceclone"
-    assert mimo[5]["visible"] is True
-    assert mimo[13]["visible"] is False
-    assert mimo[15]["visible"] is True
+    assert mimo[7]["visible"] is True
+    assert mimo[15]["visible"] is False
+    assert mimo[17]["visible"] is True
 
     assert minimax[0]["value"] == "speech-2.8-hd"
-    assert minimax[12]["value"] == "female-shaonv"
-    assert minimax[13]["visible"] is True
-    assert minimax[14]["visible"] is True
+    assert minimax[14]["value"] == "female-shaonv"
+    assert minimax[15]["visible"] is True
+    assert minimax[16]["visible"] is True
 
     mimo_preset = ui_module._tts_model_controls_update("mimo_tts", "mimo-v2.5-tts")
     mimo_clone = ui_module._tts_model_controls_update("mimo_tts", "mimo-v2.5-tts-voiceclone")

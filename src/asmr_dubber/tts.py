@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Iterable
+from functools import lru_cache
 from pathlib import Path
+
+import numpy as np
+import soundfile as sf
 
 from .errors import SynthesisError
 from .hashing import cached_sha256_file
@@ -82,6 +86,9 @@ def _index_reference_payload(project: DubProject, sentence: Sentence) -> dict[st
         payload["emotion"] = references[emotion_source]
     else:
         payload["emotion"] = emotion_source
+    if "sentence_quality_fallback" in references:
+        payload["fallback"] = references["sentence_quality_fallback"]
+        payload["fallback_version"] = references["sentence_quality_fallback_version"]
     return payload
 
 
@@ -120,12 +127,44 @@ def tts_cache_key(project: DubProject, sentence: Sentence) -> str:
         "cosyvoice_mode": settings.tts_cosyvoice_mode,
         "zh": sentence.zh_text,
         "sentence_id": sentence.id,
-        "implementation": "supported-backends-v5-api-contracts",
+        "implementation": (
+            "supported-backends-v7-stable-seed"
+            if settings.tts_backend == "indextts2_5"
+            else "supported-backends-v6-indextts25"
+        ),
     }
-    if settings.tts_backend == "indextts2":
+    if settings.tts_backend in {"indextts2_5", "indextts2"}:
         payload["index_references"] = _index_reference_payload(project, sentence)
         payload["reference_padding"] = settings.reference_padding_seconds
-    elif settings.tts_backend in {"edge_tts", "minimax"} or (
+        if settings.tts_index_emotion_source == "vector":
+            payload["emotion_vector"] = settings.tts_index25_emotion_vector
+        if settings.tts_backend == "indextts2_5":
+            payload["index25"] = {
+                "model_path": settings.tts_index25_model_path,
+                "config_path": settings.tts_index25_config_path,
+                "language": settings.tts_index25_language,
+                "bf16": settings.tts_index25_use_bf16,
+                "cuda_kernel": settings.tts_index25_use_cuda_kernel,
+                "deepspeed": settings.tts_index25_use_deepspeed,
+                "accel": settings.tts_index25_use_accel,
+                "torch_compile": settings.tts_index25_use_torch_compile,
+                "emotion_vector": settings.tts_index25_emotion_vector,
+                "use_random": settings.tts_index25_use_random,
+                "interval_silence_ms": settings.tts_index25_interval_silence_ms,
+                "max_text_tokens": settings.tts_index25_max_text_tokens,
+                "duration_factor": settings.tts_index25_duration_factor,
+                "text_normalization": settings.tts_index25_text_normalization,
+                "do_sample": settings.tts_index25_do_sample,
+                "temperature": settings.tts_index25_temperature,
+                "top_p": settings.tts_index25_top_p,
+                "top_k": settings.tts_index25_top_k,
+                "num_beams": settings.tts_index25_num_beams,
+                "repetition_penalty": settings.tts_index25_repetition_penalty,
+                "length_penalty": settings.tts_index25_length_penalty,
+                "max_mel_tokens": settings.tts_index25_max_mel_tokens,
+                "seed": settings.random_seed,
+            }
+    elif settings.tts_backend in {"edge_tts", "minimax", "generic_tts_api"} or (
         settings.tts_backend == "mimo_tts" and settings.tts_model != "mimo-v2.5-tts-voiceclone"
     ):
         payload["reference_plan"] = "unused"
@@ -144,8 +183,38 @@ def tts_cache_key(project: DubProject, sentence: Sentence) -> str:
         }
     if project.source_language != "ja":
         payload["source_language"] = project.source_language
+    if settings.tts_backend == "gpt_sovits":
+        payload["seed"] = settings.random_seed
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@lru_cache(maxsize=4096)
+def _readable_audio(path: str, size: int, modified: int) -> bool:
+    del size, modified
+    try:
+        with sf.SoundFile(path) as audio:
+            if audio.frames <= 0 or audio.samplerate <= 0:
+                return False
+            return all(
+                np.isfinite(block).all()
+                for block in audio.blocks(blocksize=262144, dtype="float32")
+            )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def valid_tts_cache(project: DubProject, sentence: Sentence, directory: Path) -> bool:
+    from .audio import resolve_project_path
+
+    if not sentence.tts_file or sentence.tts_cache_key != tts_cache_key(project, sentence):
+        return False
+    path = resolve_project_path(directory, sentence.tts_file, f"句子 {sentence.id} 的中文音频")
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    return _readable_audio(str(path), stat.st_size, stat.st_mtime_ns)
 
 
 def synthesize_sentences(

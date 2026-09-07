@@ -42,12 +42,27 @@
     "windows_cuda_wheelhouse_checksums": [],
     "indextts2_wheelhouse_archives_windows": [],
     "indextts2_wheelhouse_checksums_windows": [],
+    "indextts25_wheelhouse_archives_windows": [
+      "https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-IndexTTS25/resolve/master/ASMR-Dubber-IndexTTS25-Wheelhouse-v1.0.0.zip"
+    ],
+    "indextts25_wheelhouse_checksums_windows": [
+      "https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-IndexTTS25/resolve/master/ASMR-Dubber-IndexTTS25-Wheelhouse-v1.0.0.zip.sha256"
+    ],
     "linux_application_wheelhouse_archives": [],
     "linux_application_wheelhouse_checksums": [],
     "indextts2_wheelhouse_archives_linux": [],
     "indextts2_wheelhouse_checksums_linux": [],
     "indextts2_source_archives": [
       "https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-IndexTTS2/resolve/master/index-tts-13495845e3028f0bb6ca1462ad22aa0e76349e40.zip"
+    ],
+    "indextts25_wheelhouse_archives_linux": [
+      "https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-IndexTTS25/resolve/master/ASMR-Dubber-IndexTTS25-Wheelhouse-v1.0.0.tar.gz"
+    ],
+    "indextts25_wheelhouse_checksums_linux": [
+      "https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-IndexTTS25/resolve/master/ASMR-Dubber-IndexTTS25-Wheelhouse-v1.0.0.tar.gz.sha256"
+    ],
+    "indextts25_source_archives": [
+      "https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-IndexTTS25/resolve/master/index-tts-ee40fa7d6c6b8a2c7f06105f9f1e65775b74868c.zip"
     ],
     "ffmpeg_shared_archives_windows": [
       "artifacts/runtimes/ffmpeg/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip"
@@ -166,6 +181,9 @@
     "indextts2-checkpoints": [
       "https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-IndexTTS2/resolve/master/ASMR-Dubber-ModelPack-indextts2-checkpoints-v0.2.1.zip"
     ],
+    "indextts2_5-checkpoints": [
+      "https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-IndexTTS25/resolve/master/ASMR-Dubber-ModelPack-indextts2_5-checkpoints-v1.0.0.zip"
+    ],
     "kotoba-whisper-v2.2": [
       "https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-Windows-Advanced/resolve/master/ASMR-Dubber-ModelPack-kotoba-whisper-v2.2-v1.0.0.zip"
     ],
@@ -182,6 +200,10 @@
   "indextts2_source_archives": [
     "https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-IndexTTS2/resolve/master/index-tts-13495845e3028f0bb6ca1462ad22aa0e76349e40.zip",
     "https://github.com/index-tts/index-tts/archive/13495845e3028f0bb6ca1462ad22aa0e76349e40.zip"
+  ],
+  "indextts25_source_archives": [
+    "https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-IndexTTS25/resolve/master/index-tts-ee40fa7d6c6b8a2c7f06105f9f1e65775b74868c.zip",
+    "https://github.com/index-tts/index-tts/archive/ee40fa7d6c6b8a2c7f06105f9f1e65775b74868c.zip"
   ],
   "windows_recommended_dependency_archives": [
     "https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-Windows-Recommended/resolve/master/ASMR-Dubber-Windows-Recommended-Dependencies-v1.0.0.zip"

@@ -234,6 +234,34 @@ def test_sentence_events_plan_from_actual_audio_durations(tmp_path: Path) -> Non
     assert [event.speed_factor for event in sequential] == [1.0, 1.0]
 
 
+def test_sentence_events_ignore_punctuation_only_lines_without_tts_audio(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    chinese_dir = project_dir / "chinese"
+    chinese_dir.mkdir(parents=True)
+    sf.write(chinese_dir / "spoken.wav", np.zeros(8_000), 8_000, subtype="FLOAT")
+    sentences = [
+        Sentence(
+            id="spoken",
+            start_seconds=0.0,
+            end_seconds=1.0,
+            ja_text="はい。",
+            zh_text="好的。",
+            tts_file="chinese/spoken.wav",
+        ),
+        Sentence(
+            id="punctuation",
+            start_seconds=1.0,
+            end_seconds=2.0,
+            ja_text="……",
+            zh_text="『……』",
+        ),
+    ]
+
+    events = sentence_events(project_dir, sentences)
+
+    assert [event.sentence_id for event in events] == ["spoken"]
+
+
 def test_chinese_lines_get_consistent_active_level_without_touching_raw_files(
     tmp_path: Path,
 ) -> None:

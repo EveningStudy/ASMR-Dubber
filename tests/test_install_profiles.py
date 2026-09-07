@@ -449,8 +449,8 @@ def test_windows_setup_does_not_turn_a_successful_install_into_exit_code_zero_fa
 def test_windows_launcher_sources_match_release_version() -> None:
     for name in ("ASMRDubberLauncher.cs", "ASMRDubberSetup.cs"):
         source = (ROOT / "launcher/windows" / name).read_text(encoding="utf-8")
-        assert 'AssemblyVersion("1.3.1.0")' in source
-        assert 'AssemblyFileVersion("1.3.1.0")' in source
+        assert 'AssemblyVersion("1.4.0.0")' in source
+        assert 'AssemblyFileVersion("1.4.0.0")' in source
 
 
 def test_windows_launcher_uses_path_scoped_mutex_dynamic_port_and_product_marker() -> None:
@@ -523,3 +523,33 @@ def test_webui_backend_installer_resolves_project_root_and_reuses_setup_download
     assert 'ArchiveMirrorName "windows_cuda_wheelhouse_archives"' in source
     assert "Import-ASMRDubberAdvancedDependencies" in source
     assert "-MergeExisting" in source
+
+
+def test_indextts25_is_webui_only_and_does_not_change_setup_profiles() -> None:
+    setup_files = (
+        "scripts/windows/setup.ps1",
+        "scripts/linux/setup.sh",
+        "scripts/windows/recommended-dependencies.ps1",
+        "scripts/windows/create-recommended-dependency-pack.ps1",
+        "scripts/import_windows_dependency_pack.py",
+    )
+    for relative in setup_files:
+        source = (ROOT / relative).read_text(encoding="utf-8-sig")
+        assert "indextts25" not in source.casefold()
+        assert "indextts2_5" not in source.casefold()
+        assert "indextts-2.5" not in source.casefold()
+
+    windows = (ROOT / "scripts/windows/install-indextts25.ps1").read_text(encoding="utf-8-sig")
+    linux = (ROOT / "scripts/linux/install-indextts25.sh").read_text(encoding="utf-8")
+    for source in (windows, linux):
+        assert "indextts2_5-checkpoints" in source
+        assert "requirements.txt" in source
+        assert "--offline" in source
+        assert "--no-index" in source
+        assert "indextts" in source
+    assert 'Join-Path $_.Directory.FullName "indextts"' in windows
+    assert 'Join-Path $IndexWheelhouse "requirements.txt"' in windows
+    assert '"--find-links", $IndexWheelhouse, "--requirement", $Requirements' in windows
+    assert 'test -d "$(dirname "$1")/indextts"' in linux
+    assert 'REQUIREMENTS="$ASMR_WHEELHOUSE_RESULT/requirements.txt"' in linux
+    assert '--requirement "$REQUIREMENTS"' in linux

@@ -11,6 +11,7 @@ ASMR Dubber 默认从 ModelScope 获取引导程序、Python、依赖包、模�
 | `EveningStudyW/ASMR-Dubber-Portable-Mirror` | uv、managed CPython、CrispASR、FFmpeg、Parakeet 原始文件和依赖 wheelhouse |
 | `EveningStudyW/ASMR-Dubber-Parakeet` | Windows Parakeet 离线模型包 |
 | `EveningStudyW/ASMR-Dubber-IndexTTS2` | IndexTTS2 checkpoints 模型包和固定源码 ZIP |
+| `EveningStudyW/ASMR-Dubber-IndexTTS25` | 网页按需安装的 IndexTTS-2.5 checkpoints、固定源码和 Windows/Linux wheelhouse |
 | `EveningStudyW/ASMR-Dubber-Windows-Recommended` | Windows 推荐方案依赖包 |
 | `EveningStudyW/ASMR-Dubber-Windows-Advanced` | Windows 进阶依赖包、Kotoba、Faster-Whisper、Qwen 对齐和 ASMR VAD 模型包 |
 | `EveningStudyW/ASMR-Dubber-Windows-Portable` | 已装好依赖和模型、解压即可运行的 Windows 核心/推荐/进阶完整包 |
@@ -21,11 +22,13 @@ API Token 只用于上传或访问私有仓库。不要把 Token 写进仓库、
 
 ## 真相源
 
+表格是人工可读的合同快照。先从 lock、下载注册表和安装脚本导出/核对数值，再同步文档；修改表格不会改变下载行为。2.5 wheelhouse 的旁车校验与固定 lock 制品须分开记录，不声称所有制品由同一 lock 覆盖。
+
 发布前同时检查以下文件：
 
 1. `modelscope-artifacts.lock.json`：Portable Mirror 中固定大小和 SHA-256 的引导制品；
 2. `mirrors.json`：仓库、路径、下载优先级和海外源开关；
-3. `src/asmr_dubber/model_pack_download.py`：六个大型模型包的文件名、字节数和 SHA-256；
+3. `src/asmr_dubber/model_pack_download.py`：大型模型包的文件名、字节数和 SHA-256；
 4. `scripts/windows/recommended-dependencies.ps1`：Windows 推荐/进阶依赖包合同；
 5. IndexTTS2 安装脚本：固定源码 revision 和源码 ZIP SHA-256。
 
@@ -101,6 +104,7 @@ EveningStudyW/ASMR-Dubber-Windows-Advanced/
 |---|---|---:|---|
 | `ASMR-Dubber-Parakeet` | `ASMR-Dubber-ModelPack-parakeet-ja-windows-v0.2.1.zip` | 4,070,471,378 | `3a9e95e02df01a40533d5f73893d62fe2bf0bb897b98d2b8e494faa2ed139790` |
 | `ASMR-Dubber-IndexTTS2` | `ASMR-Dubber-ModelPack-indextts2-checkpoints-v0.2.1.zip` | 11,189,524,132 | `144aa91c4de24faf8d415df4fa4324b831609c4bbcef4406a5db4f2a952e108e` |
+| `ASMR-Dubber-IndexTTS25` | `ASMR-Dubber-ModelPack-indextts2_5-checkpoints-v1.0.0.zip` | 10,784,385,694 | `602f719a8bdae3c81b348590c8acb2618c66a4c42180eb08a0463fbaa9a039b9` |
 | `ASMR-Dubber-Windows-Advanced` | `ASMR-Dubber-ModelPack-kotoba-whisper-v2.2-v1.0.0.zip` | 3,027,748,160 | `a5da2f63fd2c4972dad4cc53db89e0d0250af9d4431905b8c558d55169734c46` |
 | `ASMR-Dubber-Windows-Advanced` | `ASMR-Dubber-ModelPack-faster-whisper-large-v2-v1.0.0.zip` | 3,087,767,076 | `4a4a213561d327e82d5dc5a8e8c071313bd948ad90f7b4c51e650044fd3bc949` |
 | `ASMR-Dubber-Windows-Advanced` | `ASMR-Dubber-ModelPack-qwen3-forced-aligner-v1.0.0.zip` | 1,837,358,823 | `6697b80bfba3a182a86290ba0f7b8adc958d7112bfe6cc9caa73bc7207b74242` |
@@ -137,6 +141,21 @@ index-tts-13495845e3028f0bb6ca1462ad22aa0e76349e40.zip
 ```
 
 源码 ZIP 与 checkpoints 模型包是两件制品，缺一不可。源码中的 `LICENSE`、`LICENSE_ZH.txt` 和其它 notices 必须保留。
+
+## IndexTTS-2.5 网页安装制品
+
+仓库：[EveningStudyW/ASMR-Dubber-IndexTTS25](https://modelscope.cn/models/EveningStudyW/ASMR-Dubber-IndexTTS25)
+
+IndexTTS-2.5 不进入任何 Setup 方案。只有用户在网页“设备与模型”中选择安装时，程序才会读取这个仓库：
+
+| 仓库根目录文件 | 字节数 | SHA-256 |
+|---|---:|---|
+| `index-tts-ee40fa7d6c6b8a2c7f06105f9f1e65775b74868c.zip` | 35,999,327 | `53ad18d03cae44d8daf29d665c889e4dfeb5e14f6a2bafb6b6a76eacfbf75440` |
+| `ASMR-Dubber-ModelPack-indextts2_5-checkpoints-v1.0.0.zip` | 10,784,385,694 | `602f719a8bdae3c81b348590c8acb2618c66a4c42180eb08a0463fbaa9a039b9` |
+| `ASMR-Dubber-IndexTTS25-Wheelhouse-v1.0.0.zip` | 3,811,887,426 | `2bbb83287e946907f914c7a8a2f8dd9e88b525e62234ef9af73d9654ec779091` |
+| `ASMR-Dubber-IndexTTS25-Wheelhouse-v1.0.0.tar.gz` | 4,413,439,982 | `fe6a4463f48ba12d2247f8d9e4b6920218ddcf17eac266b9bc3ba29ff7ae47bd` |
+
+两个 wheelhouse 各自还需要同名 `.sha256` 旁车。先上传四个大文件，确认网页显示的大小完整，再上传旁车；否则安装器会把“旁车存在但大包不完整”视为制品损坏并停止。wheelhouse 根目录必须直接包含 `requirements.txt` 和 wheels，不能再套一层 `wheels/`。
 
 ## Wheelhouse
 
@@ -201,6 +220,8 @@ $file.Length
 哈希计算期间磁盘会持续读取，但不会产生网络流量。
 
 ## 发布流程
+
+发布说明维护在[发布记录](RELEASE.md)。发布前统一 tag、包版本、公告与制品；当前 workflow 读取整份 RELEASE 文档，须防止未发布和历史内容进入新公告。完整包、源码包、wheel、模型包、依赖包要分别说明用途。
 
 1. 固定上游 revision、依赖锁和许可证；
 2. 用项目提供的打包脚本生成制品；

@@ -1,5 +1,7 @@
+import os
 from pathlib import Path
 from threading import Event, Thread
+from time import sleep
 
 import pytest
 
@@ -51,3 +53,26 @@ def test_atomic_write_replaces_complete_content_and_cleans_temporary_files(
 
     assert destination.read_text(encoding="utf-8") == "second\n"
     assert not list(tmp_path.glob(".settings.json.*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file sharing behavior")
+def test_atomic_write_waits_for_a_short_lived_windows_reader(tmp_path: Path) -> None:
+    destination = tmp_path / "project.json"
+    atomic_write_text(destination, '{"revision": 1}\n')
+    opened = Event()
+
+    def reader() -> None:
+        with destination.open(encoding="utf-8") as handle:
+            handle.read()
+            opened.set()
+            sleep(0.15)
+
+    thread = Thread(target=reader)
+    thread.start()
+    assert opened.wait(timeout=1)
+    atomic_write_text(destination, '{"revision": 2}\n')
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert destination.read_text(encoding="utf-8") == '{"revision": 2}\n'
+    assert not list(tmp_path.glob(".project.json.*.tmp"))

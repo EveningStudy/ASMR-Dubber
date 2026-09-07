@@ -338,6 +338,79 @@ def test_parakeet_stages_non_ascii_windows_input_at_ascii_path(tmp_path, monkeyp
     assert source.read_bytes() == b"audio"
 
 
+def test_parakeet_windows_unicode_portable_home_uses_ascii_relative_paths(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    portable = tmp_path / "程序目录"
+    executable = portable / "runtimes" / "crispasr" / "bin" / "crispasr.exe"
+    model = portable / "models" / "parakeet" / "parakeet-ctc-1.1b-ja-f16.gguf"
+    executable.parent.mkdir(parents=True)
+    model.parent.mkdir(parents=True)
+    executable.touch()
+    model.touch()
+    audio = tmp_path / "analysis.wav"
+    sf.write(audio, np.zeros(16_000, dtype=np.float32), 16_000)
+    calls: list[tuple[list[str], Path]] = []
+
+    class FakeProcess:
+        def __init__(self, command, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            calls.append((command, cwd))
+            payload = {
+                "crispasr": {"language": "ja"},
+                "transcription": [
+                    {
+                        "text": "声。",
+                        "offsets": {"from": 100, "to": 500},
+                    }
+                ],
+            }
+            for argument in command:
+                chunk = Path(argument)
+                if chunk.suffix != ".wav" or not chunk.parent.name.startswith("chunks-"):
+                    continue
+                resolved = chunk if chunk.is_absolute() else cwd / chunk
+                resolved.with_suffix(".json").write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+            self.stdout = iter(())
+            self.returncode = None
+
+        def wait(self):
+            self.returncode = 0
+            return 0
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(asr, "portable_home", lambda: portable)
+    monkeypatch.setattr(
+        asr,
+        "current_platform",
+        lambda: SimpleNamespace(is_windows=True),
+    )
+    monkeypatch.setattr(asr.subprocess, "Popen", FakeProcess)
+
+    sentences, _ = asr._transcribe_parakeet(audio, ProjectSettings(), None)
+
+    command, cwd = calls[0]
+    model_argument = command[command.index("-m") + 1]
+    cache_argument = command[command.index("--cache-dir") + 1]
+    audio_arguments = [argument for argument in command if argument.endswith(".wav")]
+    assert cwd == portable.resolve()
+    assert model_argument.isascii() and not Path(model_argument).is_absolute()
+    assert cache_argument.isascii() and not Path(cache_argument).is_absolute()
+    assert audio_arguments and all(argument.isascii() for argument in audio_arguments)
+    assert all(not Path(argument).is_absolute() for argument in audio_arguments)
+    assert sentences[0].ja_text == "声。"
+    assert not list((portable / "temp" / "asr").glob("parakeet-*"))
+
+
 def test_parakeet_command_pins_backend_cache_and_supported_vad(tmp_path, monkeypatch) -> None:
     portable = tmp_path / "portable"
     executable = portable / "runtimes" / "crispasr" / "bin" / "crispasr"

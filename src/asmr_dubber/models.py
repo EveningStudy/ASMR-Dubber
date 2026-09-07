@@ -4,7 +4,7 @@ import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -17,6 +17,8 @@ from .constants import (
     DEFAULT_CHINESE_DUBBING_OFFSET_MS,
     DEFAULT_CHINESE_MAX_AUTO_SPEED,
     DEFAULT_CHINESE_RELATIVE_LOUDNESS_DB,
+    DEFAULT_INDEXTTS25_CONFIG,
+    DEFAULT_INDEXTTS25_MODEL_DIR,
     DEFAULT_INDEXTTS_CONFIG,
     DEFAULT_INDEXTTS_EMOTION_WEIGHT,
     DEFAULT_INDEXTTS_MODEL_DIR,
@@ -70,6 +72,7 @@ class Sentence(BaseModel):
     tts_cache_key: str | None = None
     status: str = "pending"
     error: str | None = None
+    review_locked: bool = False
 
     @field_validator("source_text", "zh_text")
     @classmethod
@@ -125,6 +128,9 @@ class ProjectSettings(BaseModel):
     asr_chunk_seconds: float = Field(default=120.0, ge=15.0, le=600.0)
     asr_kotoba_chunk_seconds: float = Field(default=30.0, ge=5.0, le=120.0)
     asr_review_enabled: bool = False
+    asr_review_mode: Literal["suggest", "conservative"] = "suggest"
+    asr_review_window_seconds: float = Field(default=30.0, ge=10.0, le=90.0)
+    asr_review_context_seconds: float = Field(default=0.5, ge=0.0, le=3.0)
     asr_review_models: list[str] = Field(
         default_factory=lambda: list(DEFAULT_ASR_REVIEW_MODELS),
         max_length=6,
@@ -150,6 +156,7 @@ class ProjectSettings(BaseModel):
     translation_microsoft_region: str = ""
     translation_extra_body: str = "{}"
     tts_backend: Literal[
+        "indextts2_5",
         "indextts2",
         "indextts2_api",
         "generic_tts_api",
@@ -198,9 +205,36 @@ class ProjectSettings(BaseModel):
         "speaker_reference",
         "external",
         "text",
+        "vector",
     ] = "sentence_reference"
     tts_index_external_emotion_audio: str = ""
     tts_index_emo_text: str = ""
+    tts_index25_model_path: str = str(DEFAULT_INDEXTTS25_MODEL_DIR)
+    tts_index25_config_path: str = str(DEFAULT_INDEXTTS25_CONFIG)
+    tts_index25_language: Literal["zh", "en", "ja", "es", "ar"] = "zh"
+    tts_index25_use_bf16: bool = True
+    tts_index25_use_cuda_kernel: bool = False
+    tts_index25_use_deepspeed: bool = False
+    tts_index25_use_accel: bool = False
+    tts_index25_use_torch_compile: bool = False
+    tts_index25_emotion_vector: list[Annotated[float, Field(ge=0.0, le=1.0)]] = Field(
+        default_factory=lambda: [0.0] * 8,
+        min_length=8,
+        max_length=8,
+    )
+    tts_index25_use_random: bool = False
+    tts_index25_interval_silence_ms: int = Field(default=200, ge=0, le=2_000)
+    tts_index25_max_text_tokens: int = Field(default=120, ge=20, le=600)
+    tts_index25_duration_factor: float = Field(default=1.0, ge=0.5, le=2.0)
+    tts_index25_text_normalization: bool = True
+    tts_index25_do_sample: bool = True
+    tts_index25_temperature: float = Field(default=0.8, gt=0.0, le=2.0)
+    tts_index25_top_p: float = Field(default=0.8, gt=0.0, le=1.0)
+    tts_index25_top_k: int = Field(default=30, ge=0, le=100)
+    tts_index25_num_beams: int = Field(default=3, ge=1, le=10)
+    tts_index25_repetition_penalty: float = Field(default=10.0, ge=0.1, le=20.0)
+    tts_index25_length_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    tts_index25_max_mel_tokens: int = Field(default=1_500, ge=100, le=1_815)
     tts_gpt_top_k: int = Field(default=15, ge=1, le=100)
     tts_gpt_text_split_method: str = "cut5"
     tts_gpt_sample_steps: int = Field(default=32, ge=1, le=64)
@@ -257,6 +291,7 @@ class ProjectSettings(BaseModel):
                 "faster_whisper",
             }
             supported_tts = {
+                "indextts2_5",
                 "indextts2",
                 "indextts2_api",
                 "generic_tts_api",
@@ -375,7 +410,7 @@ class DubProject(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: int = PROJECT_SCHEMA_VERSION
-    app_version: str = "1.3.1"
+    app_version: str = "1.4.0"
     revision: int = Field(default=0, ge=0)
     migration_warnings: list[str] = Field(default_factory=list)
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -405,6 +440,13 @@ class DubProject(BaseModel):
 
     def touch(self) -> None:
         self.updated_at = datetime.now(UTC).isoformat()
+
+    @model_validator(mode="after")
+    def unique_sentence_ids(self) -> DubProject:
+        ids = [sentence.id.casefold() for sentence in self.sentences]
+        if len(ids) != len(set(ids)):
+            raise ValueError("sentence IDs must be unique (case insensitive)")
+        return self
 
 
 def manifest_path(path: str | os.PathLike[str] | None) -> Path:
@@ -450,6 +492,9 @@ def load_project(path: str | os.PathLike[str] | None) -> tuple[DubProject, Path]
 
 
 def save_project(project: DubProject, project_dir: str | os.PathLike[str]) -> Path:
+    ids = [sentence.id.casefold() for sentence in project.sentences]
+    if len(ids) != len(set(ids)):
+        raise ProjectError("sentence IDs must be unique (case insensitive)")
     directory = Path(project_dir).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / "project.json"
@@ -557,7 +602,7 @@ def _migrate_project_payload(data: dict[str, Any]) -> dict[str, Any]:
                 settings[field] = DEFAULT_ASR_REVIEW_TEXT_PRIORITY
         payload["settings"] = settings
         payload["schema_version"] = 2
-        payload["app_version"] = "1.3.1"
+        payload["app_version"] = "1.4.0"
         payload["revision"] = int(payload.get("revision", 0))
         payload["migration_warnings"] = warnings
         version = 2

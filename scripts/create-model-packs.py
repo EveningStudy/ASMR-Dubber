@@ -14,6 +14,8 @@ from asmr_dubber import __version__  # noqa: E402
 from asmr_dubber.constants import (  # noqa: E402
     ASMR_VAD_MODEL,
     DEFAULT_ALIGNER_MODEL,
+    INDEXTTS25_REQUIRED_DIRS,
+    INDEXTTS25_REQUIRED_FILES,
     INDEXTTS_REQUIRED_DIRS,
     INDEXTTS_REQUIRED_FILES,
     OPTIONAL_ASR_MODEL_REVISIONS,
@@ -74,6 +76,12 @@ PACKS = {
         platforms=("windows", "linux"),
         architectures=("any",),
     ),
+    "indextts2_5-checkpoints": PackDefinition(
+        pack_id="indextts2_5-checkpoints",
+        display_name="IndexTTS-2.5 官方 checkpoints",
+        platforms=("windows", "linux"),
+        architectures=("any",),
+    ),
 }
 
 
@@ -130,12 +138,32 @@ def _sources(pack_id: str) -> list[ModelPackSource]:
         required = [
             ModelPackSource(checkpoints / relative, f"{relative_root}/{relative}")
             for relative in sorted(INDEXTTS_REQUIRED_FILES)
+            if not any(relative.startswith(directory + "/") for directory in INDEXTTS_REQUIRED_DIRS)
         ]
         required.extend(
             ModelPackSource(checkpoints / relative, f"{relative_root}/{relative}")
             for relative in sorted(INDEXTTS_REQUIRED_DIRS)
         )
         for optional in ("LICENSE.txt", "LICENSE_ZH.txt", "README.md", "pinyin.vocab"):
+            source = checkpoints / optional
+            if source.is_file():
+                required.append(ModelPackSource(source, f"{relative_root}/{optional}"))
+        return required
+    if pack_id == "indextts2_5-checkpoints":
+        checkpoints = home / "runtimes" / "index-tts-2.5" / "checkpoints"
+        relative_root = "runtimes/index-tts-2.5/checkpoints"
+        required = [
+            ModelPackSource(checkpoints / relative, f"{relative_root}/{relative}")
+            for relative in sorted(INDEXTTS25_REQUIRED_FILES)
+            if not any(
+                relative.startswith(directory + "/") for directory in INDEXTTS25_REQUIRED_DIRS
+            )
+        ]
+        required.extend(
+            ModelPackSource(checkpoints / relative, f"{relative_root}/{relative}")
+            for relative in sorted(INDEXTTS25_REQUIRED_DIRS)
+        )
+        for optional in ("LICENSE", "README.md", "configuration.json"):
             source = checkpoints / optional
             if source.is_file():
                 required.append(ModelPackSource(source, f"{relative_root}/{optional}"))

@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 from collections.abc import Mapping
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -80,6 +81,32 @@ _AUDIO_BASE64_PATHS = (
     "output.audio_base64",
 )
 _AUDIO_URL_PATHS = ("url", "audio_url", "data.url", "data.audio_url", "output.url")
+MAX_AUDIO_RESPONSE_BYTES = 256 * 1024 * 1024
+
+
+def _download_audio(url: str, output: Path, client: httpx.Client) -> None:
+    """Reuse transport settings, never the service's credentials or cookies."""
+    parsed = urlparse(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
+        raise APIContractError("音频下载地址必须是不含登录凭证的 HTTP(S) 地址。")
+    request = httpx.Request("GET", url, extensions={"timeout": client.timeout.as_dict()})
+    with closing(client.send(request, auth=None, follow_redirects=False, stream=True)) as download:
+        if not download.is_success:
+            raise APIContractError(f"下载音频失败（HTTP {download.status_code}）；不接受重定向。")
+        size = 0
+        with output.open("wb") as handle:
+            for chunk in download.iter_bytes():
+                size += len(chunk)
+                if size > MAX_AUDIO_RESPONSE_BYTES:
+                    raise APIContractError("音频响应超过 256 MiB 上限。")
+                handle.write(chunk)
+        if not size:
+            raise APIContractError("API 返回了空音频。")
 
 
 def write_audio_response(
@@ -90,6 +117,8 @@ def write_audio_response(
 ) -> None:
     if response.is_error:
         raise APIContractError(f"HTTP {response.status_code}：{response.text[:500]}")
+    if len(response.content) > MAX_AUDIO_RESPONSE_BYTES:
+        raise APIContractError("音频响应超过 256 MiB 上限。")
     content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type.startswith("audio/") or content_type == "application/octet-stream":
         if not response.content:
@@ -123,10 +152,7 @@ def write_audio_response(
         url = _nested_value(payload, path)
         if not isinstance(url, str) or not url.strip():
             continue
-        download = client.get(url.strip())
-        if download.is_error or not download.content:
-            raise APIContractError(f"下载 API 返回的音频地址失败（HTTP {download.status_code}）。")
-        output.write_bytes(download.content)
+        _download_audio(url.strip(), output, client)
         return
     raise APIContractError(
         "API JSON 响应中没有音频；支持 audio/audio_base64、data.audio、output.audio "

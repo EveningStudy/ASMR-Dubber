@@ -41,7 +41,7 @@ command -v bash curl tar getconf
 
 ## 硬件怎么选
 
-本地识别既能用 CPU，也能用 NVIDIA CUDA。CPU 适合短音频、验证流程或没有独立显卡的电脑；处理长音频时通常慢得多。IndexTTS2 支持 CPU 和 NVIDIA CUDA，但 CPU 模式通常会慢很多，建议优先使用 CUDA。
+本地识别既能用 CPU，也能用 NVIDIA CUDA。CPU 适合短音频、验证流程或没有独立显卡的电脑；处理长音频时通常慢得多。IndexTTS2 和按需安装的 IndexTTS-2.5 支持 CPU 与 NVIDIA CUDA，但 CPU 模式通常会慢很多，建议优先使用 CUDA。
 
 | 组件 | 最低条件 | 更合适的配置 |
 |---|---|---|
@@ -50,7 +50,8 @@ command -v bash curl tar getconf
 | Faster-Whisper（日语/英语）| CPU；GPU 约 2 GB 显存起 | 约 6 GB 以上显存 |
 | ASMR 专用 VAD | CPU，ONNX Runtime | 无需独立显卡 |
 | Qwen3 ForcedAligner | CPU 或 CUDA，实际速度取决于 PyTorch | 与识别模型共用时留足显存 |
-| IndexTTS2 | NVIDIA CUDA，约 6 GB 显存起 | 10 GB 以上显存 |
+| IndexTTS2 | CPU 或 NVIDIA CUDA；GPU 约 6 GB 显存起 | GPU 10 GB 以上显存；CPU 很慢 |
+| IndexTTS-2.5 | CPU 或 NVIDIA CUDA | 支持 BF16、10 GB 以上显存的 NVIDIA 显卡 |
 
 显存下限表示模型有机会装入，不代表长任务一定稳定。显示器、浏览器和其它程序也会占显存。6 GB 显存的电脑建议一次只运行一个模型、保持批大小为 1，并关闭其它 GPU 程序。AMD/Intel 显卡不会用于这些 CUDA 后端，可改用 CPU 识别、Edge TTS 或云端 TTS。
 
@@ -58,7 +59,7 @@ Windows 完整本地 GPU 环境以 NVIDIA Turing 或更新架构为支持范围�
 
 ## 下载
 
-Windows 用户从[GitHub Releases](https://github.com/EveningStudy/asmr-dubber/releases/latest)下载带版本号的压缩包，例如 `ASMR-Dubber-windows-portable-v1.3.1.zip`。完整解压到最终使用位置后运行 Setup；发行包不包含大型模型和已经安装的 Python 依赖。
+Windows 用户从[GitHub Releases](https://github.com/EveningStudy/asmr-dubber/releases/latest)下载带版本号的压缩包，例如 `ASMR-Dubber-windows-portable-v1.4.0.zip`。完整解压到最终使用位置后运行 Setup；GitHub 便携包不含大型模型，打包流程可包含 Python 和核心依赖 wheel，首次启动仍需建立环境。ModelScope 完整包与源码包不是同一种制品，应按下载页清单区分。
 
 ## 三种安装方案
 
@@ -104,6 +105,12 @@ Windows 用户从[GitHub Releases](https://github.com/EveningStudy/asmr-dubber/r
 Windows NVIDIA 环境还会准备这些模型需要的 PyTorch、Transformers、Accelerate、ONNX Runtime、`qwen-asr` 和 Faster-Whisper/CTranslate2。它们是运行库，不是额外模型。
 
 进阶方案适合需要切换识别器、多模型交叉校对、ASMR 专用 VAD 或独立时间戳对齐的用户。它不会顺带下载 Kotoba v2.0/v2.1、Faster-Whisper large-v3 或其它注册表模型。large-v3 可以按[后端指南](BACKENDS.md#使用-large-v3)放入程序目录。
+
+### IndexTTS-2.5 按需安装
+
+IndexTTS-2.5 不属于基础、推荐或进阶方案。先用任一方案完成 Setup，再启动网页，在“设置 → 设备与模型”选择“IndexTTS-2.5 本地音色克隆”并安装。安装完成后，到 TTS（语音合成）设置中主动切换；推荐方案和新项目仍默认使用旧 IndexTTS2。
+
+Windows 与 Linux 使用各自独立 wheelhouse，模型权重和依赖合计约 15 GB；安装期间还需要解压和旧环境备份空间。模型只使用固定哈希的 ModelScope 模型包，不回退到浮动版本权重。源码可在明确允许海外下载时回退固定版本 GitHub 归档。断线后重新点击安装会复用已校验文件并继续下载；失败时原源码和环境可恢复，模型下载断点保留。
 
 ## Windows 安装
 
@@ -177,7 +184,7 @@ ASMR_DUBBER_SKIP_RECOMMENDED_TTS=1 bash scripts/linux/setup.sh 推荐
 
 1. 运行时、依赖包和模型包优先从 ModelScope 获取；
 2. ModelScope wheelhouse 没有发布时，小型 Python 依赖可使用配置中的国内 PyPI 镜像；
-3. GitHub、Hugging Face、hf-mirror、官方 PyPI 和 PyTorch 海外源默认关闭；
+3. GitHub、Hugging Face、hf-mirror、官方 PyPI 和 PyTorch 海外源默认关闭；IndexTTS-2.5 同样遵守此策略，模型不使用浮动版本回退；
 4. 所有固定制品在使用前检查大小和 SHA-256，模型包还会检查内部 manifest。
 
 公开 ModelScope 仓库通常不需要 Token。私有仓库才需要在当前终端临时设置 `MODELSCOPE_API_TOKEN`，不要把 Token 写进文档、脚本或问题附件。
@@ -217,7 +224,11 @@ bash scripts/linux/run-cli.sh import-model-packs --all
 
 ## 验证安装
 
-启动网页后打开“设置 → 设备与模型”，点击“重新检测硬件与后端”。“可用”表示运行依赖和所需模型都完整；“模型不完整”与“未安装”是两种不同状态。
+### Wheel 与完整程序的边界
+
+wheel 提供 CLI/API 和 Python 包，不包含便携安装脚本及镜像资源。需要网页内自动安装本地模型时，请使用完整源码或便携发行包。程序会对 wheel 中的自动安装请求给出明确说明，不会在 site-packages 的上级目录猜测安装位置。
+
+启动网页后打开“设置 → 设备与模型”，点击“重新检测硬件与后端”。“可用”表示通过静态依赖和模型检查，不代表本机已经真实推理或完成质量验收；“模型不完整”与“未安装”是两种不同状态。
 
 命令行检查不会加载大型模型：
 
@@ -239,7 +250,9 @@ bash scripts/linux/run-cli.sh doctor --no-network
 
 移动或备份前先关闭启动终端，确保没有安装、识别或合成任务正在运行。复制整个程序目录即可保留项目、设置、密钥、模型和缓存。移动到新路径后运行一次 Setup，让便携虚拟环境修复路径。
 
-如果只想重新安装运行环境，可以在做好项目和密钥备份后删除 `.asmr-dubber`，再运行 Setup。这会同时删除模型、缓存、配置和默认项目目录，不能撤销。
+只修复环境时，优先重跑同档 Setup 或“设备与模型 → 安装/修复”。不要删除整个 `.asmr-dubber`：它还包含项目、配置、密钥、模型和恢复缓存。
+
+彻底重置是最后手段。先备份整个数据目录及外部项目目录并验证备份，优先改名保留旧目录，不永久删除。IndexTTS-2.5 修复备份在 `runtimes/.index-tts-2.5-backup-*`，确认新环境可用前不要清理。此操作不等同于常规升级。
 
 完整卸载步骤：
 

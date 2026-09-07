@@ -66,7 +66,7 @@ ASR（语音识别）范围：
 
 TTS（语音合成）范围：
 
-- IndexTTS2 本地后端和 IndexTTS2 API；
+- IndexTTS2、IndexTTS-2.5 本地后端和 IndexTTS2 API；
 - 通用 TTS API（OpenAI-compatible）；
 - GPT-SoVITS API；
 - CosyVoice API；
@@ -137,7 +137,10 @@ PowerShell 5.1 解析所有脚本；现有需要兼容 5.1 的文件应保留 UT
 
 ### 设置和 UI
 
-- “仅保存默认值”和“保存并应用到当前项目”的不同结果；
+- 测试仅默认值、仅当前项目、两者三种保存范围；
+- 在同一进程测试保存、浏览器刷新、重新打开，不只测试 UI 图构建；
+- 覆盖 500 行以上表格、长文本、布尔文本往返与首次加载；
+- 验证完整中文字幕绕过 ASR/正文翻译，混合语言不误报覆盖不足；
 - ASR 设置变化后当前结果被标记为待更新；
 - 切换服务或后端时只显示相关参数；
 - 中文界面的首次缩写写成 ASR（语音识别）、TTS（语音合成）、VAD（语音活动检测）；
@@ -181,4 +184,6 @@ uv run --no-sync python scripts/smoke_models.py --help
 
 ## 发布记录
 
-实现和验收完成后再更新 `docs/RELEASE.md`。每个版本都要保留 Linux 长期未维护、当前发布不保证可用的提示；没有重新完成 Linux 安装与功能验证时，不得删除这条提示。
+实现先记入 Unreleased，发布时转入具体版本。按平台记录日期、commit/工作树、安装方式和验证范围；Linux 测试通过不代表干净安装或 GPU 已验证，不使用永久过时的统一支持断言。
+
+当前发布脚本读取整份 `docs/RELEASE.md`；发布前应确认公告仅包含目标版本，不把 Unreleased 或历史说明一并发布。

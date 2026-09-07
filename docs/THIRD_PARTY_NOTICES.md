@@ -19,13 +19,13 @@ ASMR Dubber 自身代码采用[MIT License](../LICENSE)。这个许可证只覆�
 
 模型包中的格式转换、量化或镜像分发不会把上游许可证改成 ASMR Dubber 的 MIT License。归属、引用、再分发和衍生模型义务应按模型卡及包内文件执行。
 
-## IndexTTS2
+## IndexTTS2 与 IndexTTS-2.5
 
-IndexTTS2 来自[index-tts/index-tts](https://github.com/index-tts/index-tts)。上游仓库的代码、权重和模型输出受独立的 **bilibili Model Use License Agreement** 约束，不属于 OSI MIT 许可证。
+IndexTTS2 与 IndexTTS-2.5 来自[index-tts/index-tts](https://github.com/index-tts/index-tts)。上游仓库的代码、权重和模型输出受独立的 **bilibili Model Use License Agreement** 约束，不属于 OSI MIT 许可证。
 
 该协议包含使用限制、下游分发义务、合规责任、高风险场景条款，以及针对特定用户规模或营收组织的单独授权条件。上游 README 也要求商业使用与合作方联系作者。不要根据“GitHub 可下载”推断任何用途都自动获准。
 
-安装器固定一份上游源码 revision，并在隔离运行时保留 `LICENSE`、`LICENSE_ZH.txt` 和相关说明。运行或分发前应阅读这些原文；不同意时不要安装或使用 IndexTTS2。
+两个本地后端分别固定上游源码 revision，并在各自隔离运行时保留 `LICENSE`、`LICENSE_ZH.txt` 和相关说明。运行或分发前应阅读这些原文；不同意时不要安装或使用。
 
 ## 基础运行时和媒体组件
 
@@ -79,6 +79,8 @@ OpenAI-compatible 只是请求格式，不说明服务端采用何种代码、�
 不得使用本工具实施冒充、欺诈、骚扰、诽谤、未经许可的声音克隆，或其它侵犯知识产权、隐私与人格权益的行为。
 
 ## 发布者检查清单
+
+本页是许可导航，不是所有组件授权已经重新审计的声明。发布时记录实际源码、权重、二进制的仓库、revision、许可文件和核验日期；上游最新网页不能替代固定制品原文。`DEPENDENCIES.json` 只覆盖便携包核心 wheels，不覆盖独立模型环境，也不替代许可判断。
 
 重新分发 ASMR Dubber、便携运行时或模型包时，至少完成：
 

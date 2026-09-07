@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -70,4 +71,7 @@ def measure_stage(
         }
         if error_type:
             event["error_type"] = error_type
-        _append_event(project_dir.resolve(), event)
+        try:
+            _append_event(project_dir.resolve(), event)
+        except Exception:
+            logging.getLogger(__name__).warning("无法写入性能记录；业务结果不受影响", exc_info=True)

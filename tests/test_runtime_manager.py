@@ -10,6 +10,8 @@ import pytest
 
 from asmr_dubber.constants import (
     DEFAULT_ALIGNER_MODEL,
+    INDEXTTS25_REQUIRED_DIRS,
+    INDEXTTS25_REQUIRED_FILES,
     INDEXTTS_REQUIRED_DIRS,
     INDEXTTS_REQUIRED_FILES,
 )
@@ -255,7 +257,7 @@ def test_tts_backend_order_keeps_generic_api_last(monkeypatch) -> None:
 
     ordered = [backend.id for backend in ordered_backends(TTS_BACKENDS, UserSettings())]
 
-    assert ordered[:2] == ["indextts2", "edge_tts"]
+    assert ordered[:2] == ["indextts2", "indextts2_5"]
     assert ordered[-1] == "generic_tts_api"
 
 
@@ -279,6 +281,33 @@ def test_indextts_status_accepts_windows_runtime(monkeypatch, tmp_path: Path) ->
     settings = UserSettings(tts_model_path=str(model_dir))
 
     status = backend_status(TTS_BACKENDS["indextts2"], settings=settings)
+    assert status.state == "ready"
+    assert Path(status.detail).samefile(executable)
+
+
+def test_indextts25_status_accepts_its_separate_windows_runtime(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "asmr_dubber.runtime_manager.current_platform",
+        lambda: PlatformInfo("Windows", "AMD64", True, False, False),
+    )
+    root = tmp_path / "index-tts-2.5"
+    model_dir = root / "checkpoints"
+    model_dir.mkdir(parents=True)
+    for relative in INDEXTTS25_REQUIRED_FILES:
+        path = model_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    for relative in INDEXTTS25_REQUIRED_DIRS:
+        (model_dir / relative).mkdir(parents=True, exist_ok=True)
+    executable = root / ".venv" / "Scripts" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    settings = UserSettings(tts_index25_model_path=str(model_dir))
+
+    status = backend_status(TTS_BACKENDS["indextts2_5"], settings=settings)
     assert status.state == "ready"
     assert Path(status.detail).samefile(executable)
 
@@ -455,10 +484,10 @@ def test_download_backend_models_reuses_imported_pack_without_network(
 def test_indextts_uses_isolated_runtime_installer(monkeypatch, tmp_path: Path) -> None:
     uv = tmp_path / "uv"
     uv.touch()
-    calls: list[dict[str, object]] = []
+    calls: list[tuple[str, dict[str, object]]] = []
 
-    def fake_install(**kwargs):
-        calls.append(kwargs)
+    def fake_install(backend_id: str, **kwargs):
+        calls.append((backend_id, kwargs))
         return CompletedProcess(["installer"], 0, stdout="IndexTTS ready", stderr="")
 
     monkeypatch.setattr("asmr_dubber.runtime_manager._uv_executable", lambda: uv)
@@ -471,11 +500,30 @@ def test_indextts_uses_isolated_runtime_installer(monkeypatch, tmp_path: Path) -
 
     result = install_backend("indextts2", force=True)
 
-    assert calls
+    assert calls[0][0] == "indextts2"
     assert "IndexTTS ready" in result
 
 
-def test_install_cuda_only_backend_is_blocked_without_nvidia(monkeypatch, tmp_path: Path) -> None:
+def test_indextts25_uses_its_own_web_installer(monkeypatch, tmp_path: Path) -> None:
+    uv = tmp_path / "uv"
+    uv.touch()
+    calls: list[str] = []
+
+    def fake_install(backend_id: str, **_kwargs):
+        calls.append(backend_id)
+        return CompletedProcess(["installer"], 0, stdout="IndexTTS-2.5 ready", stderr="")
+
+    monkeypatch.setattr("asmr_dubber.runtime_manager._uv_executable", lambda: uv)
+    monkeypatch.setattr("asmr_dubber.runtime_manager._install_indextts_runtime", fake_install)
+    monkeypatch.setattr("asmr_dubber.runtime_manager.detect_hardware", lambda: _hardware(cuda=True))
+
+    result = install_backend("indextts2_5", force=True)
+
+    assert calls == ["indextts2_5"]
+    assert "IndexTTS-2.5 ready" in result
+
+
+def test_indextts_install_supports_cpu_without_nvidia(monkeypatch, tmp_path: Path) -> None:
     uv = tmp_path / "uv"
     uv.touch()
     monkeypatch.setattr("asmr_dubber.runtime_manager._uv_executable", lambda: uv)
@@ -483,8 +531,15 @@ def test_install_cuda_only_backend_is_blocked_without_nvidia(monkeypatch, tmp_pa
         "asmr_dubber.runtime_manager.detect_hardware", lambda: _hardware(cuda=False)
     )
 
-    with pytest.raises(AppEnvironmentError, match="需要 NVIDIA CUDA GPU"):
-        install_backend("indextts2", force=True)
+    calls = []
+
+    def fake_install(backend_id, **kwargs):
+        calls.append(backend_id)
+        return CompletedProcess(["installer"], 0, stdout="CPU ready", stderr="")
+
+    monkeypatch.setattr("asmr_dubber.runtime_manager._install_indextts_runtime", fake_install)
+    assert "CPU ready" in install_backend("indextts2", force=True)
+    assert calls == ["indextts2"]
 
 
 def test_streaming_installer_forwards_stdout_and_stderr(tmp_path: Path) -> None:

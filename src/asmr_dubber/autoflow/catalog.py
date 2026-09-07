@@ -193,7 +193,12 @@ def _subtitle_content_language(path: Path | None) -> str | None:
     text = _subtitle_sample(path)
     if not text:
         return None
-    kana = len(re.findall(r"[\u3040-\u30ff]", text))
+    # U+30FB middle dot is common in Chinese transliterated names; it is not kana.
+    kana = sum(
+        "LETTER" in unicodedata.name(character, "")
+        and any(script in unicodedata.name(character, "") for script in ("HIRAGANA", "KATAKANA"))
+        for character in text
+    )
     han = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
     latin = len(re.findall(r"[A-Za-z]", text))
     if kana:

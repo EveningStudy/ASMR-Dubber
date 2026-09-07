@@ -25,6 +25,7 @@ from asmr_dubber.tts_backends import (
     _load_indextts,
     _mimo_runner,
     _minimax_runner,
+    _synthesize_indextts25_batch,
     _synthesize_indextts_cli_batch,
     synthesize_with_selected_backend,
 )
@@ -632,6 +633,113 @@ def test_edge_tts_contract_and_wav_conversion(tmp_path: Path, monkeypatch) -> No
     assert sf.info(output).frames == 2400
 
 
+def test_edge_tts_retries_temporary_network_errors(tmp_path: Path, monkeypatch) -> None:
+    calls = 0
+    delays = []
+
+    class FakeCommunicate:
+        def __init__(self, _text, *, voice, rate):
+            assert voice == "zh-CN-XiaoxiaoNeural"
+            assert rate == "+0%"
+
+        async def save(self, path):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise OSError("temporary connection reset")
+            Path(path).write_bytes(b"mock-mp3")
+
+    monkeypatch.setitem(sys.modules, "edge_tts", SimpleNamespace(Communicate=FakeCommunicate))
+    monkeypatch.setattr("asmr_dubber.tts_backends.time.sleep", delays.append)
+
+    def fake_ffmpeg(arguments, **_kwargs):
+        assert Path(arguments[2]).read_bytes() == b"mock-mp3"
+        sf.write(Path(arguments[-1]), np.zeros(800, dtype=np.float32), 8_000)
+
+    monkeypatch.setattr("asmr_dubber.audio._run_ffmpeg", fake_ffmpeg)
+    project = _project()
+    project.settings.tts_backend = "edge_tts"
+    output = tmp_path / "output.wav"
+
+    run, cleanup = _edge_tts_runner(project)
+    run(project.sentences[0], VoiceReference(Path(), "", "unused"), output)
+    cleanup()
+
+    assert calls == 3
+    assert delays == [1.0, 2.0]
+    assert sf.info(output).frames == 800
+    assert list(tmp_path.glob(".*.edge.mp3")) == []
+
+
+def test_edge_tts_reports_dns_failure_after_retries(tmp_path: Path, monkeypatch) -> None:
+    calls = 0
+
+    class FakeCommunicate:
+        def __init__(self, _text, **_kwargs):
+            pass
+
+        async def save(self, _path):
+            nonlocal calls
+            calls += 1
+            raise OSError("getaddrinfo failed")
+
+    monkeypatch.setitem(sys.modules, "edge_tts", SimpleNamespace(Communicate=FakeCommunicate))
+    monkeypatch.setattr("asmr_dubber.tts_backends.time.sleep", lambda _delay: None)
+    project = _project()
+    project.settings.tts_backend = "edge_tts"
+
+    run, cleanup = _edge_tts_runner(project)
+    with pytest.raises(SynthesisError, match="DNS、代理或 TUN"):
+        run(
+            project.sentences[0],
+            VoiceReference(Path(), "", "unused"),
+            tmp_path / "output.wav",
+        )
+    cleanup()
+
+    assert calls == 4
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_all_tts_backends_skip_punctuation_only_text_before_loading_runner(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = _project()
+    sentence = project.sentences[0]
+    sentence.zh_text = "『……』"
+    sentence.tts_file = "chinese/stale.wav"
+    sentence.tts_duration_seconds = 1.0
+    sentence.tts_cache_key = "stale"
+    sentence.reference_file = "reference.wav"
+    sentence.status = "error"
+    sentence.error = "old error"
+    project.sentences = [sentence]
+    source = tmp_path / "source.wav"
+    source.touch()
+    checkpoints = []
+    monkeypatch.setattr(
+        "asmr_dubber.tts_backends._runner",
+        lambda _project: pytest.fail("a TTS runner must not load for punctuation-only text"),
+    )
+
+    failures = synthesize_with_selected_backend(
+        project,
+        tmp_path,
+        source,
+        on_sentence=lambda: checkpoints.append(True),
+    )
+
+    assert failures == []
+    assert sentence.status == "skipped_tts"
+    assert sentence.error is None
+    assert sentence.tts_file is None
+    assert sentence.tts_duration_seconds is None
+    assert sentence.tts_cache_key is None
+    assert sentence.reference_file is None
+    assert checkpoints == [True]
+
+
 def test_mimo_voice_clone_http_contract(tmp_path: Path, monkeypatch) -> None:
     requests = []
 
@@ -753,7 +861,7 @@ def test_indextts_cancel_after_child_exit_is_not_reported_as_failure(
             self.stdout = iter(())
             self.returncode = None
 
-        def wait(self):
+        def wait(self, timeout=None):
             signal.set()
             self.returncode = 1
             return self.returncode
@@ -785,3 +893,72 @@ def test_indextts_cancel_after_child_exit_is_not_reported_as_failure(
             None,
             signal,
         )
+
+
+def test_indextts25_worker_receives_runtime_source_on_pythonpath(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = _project()
+    project.sentences = [project.sentences[0]]
+    runtime_root = tmp_path / "index-tts-2.5"
+    model_dir = runtime_root / "checkpoints"
+    model_dir.mkdir(parents=True)
+    config = model_dir / "config.yaml"
+    config.touch()
+    project.settings.tts_index25_model_path = str(model_dir)
+    project.settings.tts_index25_config_path = str(config)
+    source = tmp_path / "source.wav"
+    reference_path = tmp_path / "reference.wav"
+    sf.write(source, np.zeros(16_000 * 2, dtype=np.float32), 16_000)
+    sf.write(reference_path, np.zeros(16_000, dtype=np.float32), 16_000)
+    reference = VoiceReference(reference_path, "参考です。", "shared")
+    (tmp_path / "chinese").mkdir()
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        def __init__(self, command, **kwargs):
+            captured["command"] = command
+            captured.update(kwargs)
+            manifest = Path(command[command.index("--batch-file") + 1])
+            task = json.loads(manifest.read_text(encoding="utf-8").splitlines()[0])
+            sf.write(Path(task["output"]), np.zeros(2400, dtype=np.float32), 24_000)
+            self.stdout = iter((f"Generated: {task['id']}\n",))
+            self.returncode = 0
+
+        def wait(self):
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(
+        "asmr_dubber.tts_backends._indextts25_command",
+        lambda _project: ["python", "indextts25_worker.py"],
+    )
+    monkeypatch.setattr(
+        "asmr_dubber.tts_backends.prepare_index_speaker_reference",
+        lambda *_args: reference,
+    )
+    monkeypatch.setattr(
+        "asmr_dubber.tts_backends.prepare_index_emotion_reference",
+        lambda *_args: reference,
+    )
+    monkeypatch.setattr("asmr_dubber.tts_backends.subprocess.Popen", FakeProcess)
+
+    failures = _synthesize_indextts25_batch(
+        project,
+        tmp_path,
+        source,
+        project.sentences,
+        None,
+        None,
+        None,
+    )
+
+    assert failures == []
+    assert captured["cwd"] == runtime_root
+    pythonpath = str(captured["env"]["PYTHONPATH"])
+    assert pythonpath.split(";" if sys.platform == "win32" else ":", 1)[0] == str(runtime_root)
+    assert project.sentences[0].tts_file
+    assert (tmp_path / project.sentences[0].tts_file).is_file()

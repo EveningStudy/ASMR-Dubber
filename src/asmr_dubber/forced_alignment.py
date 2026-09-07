@@ -89,6 +89,11 @@ def _cleanup_cuda() -> None:
         pass
 
 
+def _read_alignment_window(path: Path, start: int, end: int) -> np.ndarray:
+    waveform, _rate = sf.read(path, start=start, stop=end, dtype="float32", always_2d=True)
+    return np.asarray(waveform.mean(axis=1, dtype=np.float32), dtype=np.float32)
+
+
 def align_sentences_with_qwen(
     audio_path: Path,
     sentences: list[Sentence],
@@ -119,11 +124,9 @@ def align_sentences_with_qwen(
     use_cuda = settings.asr_device.startswith("cuda")
     if use_cuda:
         require_cuda()
-    waveform, sample_rate = sf.read(audio_path, dtype="float32", always_2d=False)
-    waveform = np.asarray(waveform, dtype=np.float32)
-    if waveform.ndim == 2:
-        waveform = waveform.mean(axis=1, dtype=np.float32)
-    if waveform.ndim != 1 or sample_rate <= 0:
+    audio_info = sf.info(audio_path)
+    sample_rate = audio_info.samplerate
+    if audio_info.frames <= 0 or sample_rate <= 0:
         raise AsmrDubberError("Qwen3 ForcedAligner 无法读取 ASR（语音识别）分析音频。")
 
     source, revision = resolve_transformers_model_source(model_id)
@@ -142,14 +145,14 @@ def align_sentences_with_qwen(
             progress("加载 Qwen3 ForcedAligner（时间戳对齐）", 0, len(sentences))
         model = Qwen3ForcedAligner.from_pretrained(source, **kwargs)
         check_cancelled(cancel_event)
-        duration = len(waveform) / sample_rate
+        duration = audio_info.frames / sample_rate
         padding = max(0.75, min(2.0, settings.asr_review_max_drift_seconds))
         for index, sentence in enumerate(sentences, start=1):
             check_cancelled(cancel_event)
             crop_start = max(0.0, sentence.start_seconds - padding)
             crop_end = min(duration, sentence.end_seconds + padding)
             start_sample = max(0, int(crop_start * sample_rate))
-            end_sample = min(len(waveform), int(np.ceil(crop_end * sample_rate)))
+            end_sample = min(audio_info.frames, int(np.ceil(crop_end * sample_rate)))
             record: dict[str, Any] = {
                 "sentence_id": sentence.id,
                 "fallback": True,
@@ -163,7 +166,10 @@ def align_sentences_with_qwen(
                 )
             try:
                 aligned = model.align(
-                    audio=(waveform[start_sample:end_sample], sample_rate),
+                    audio=(
+                        _read_alignment_window(audio_path, start_sample, end_sample),
+                        sample_rate,
+                    ),
                     text=sentence.source_text,
                     language=qwen_language_name(source_language),
                 )
@@ -239,13 +245,11 @@ def align_script_sentences_with_qwen(
     use_cuda = settings.asr_device.startswith("cuda")
     if use_cuda:
         require_cuda()
-    waveform, sample_rate = sf.read(audio_path, dtype="float32", always_2d=False)
-    waveform = np.asarray(waveform, dtype=np.float32)
-    if waveform.ndim == 2:
-        waveform = waveform.mean(axis=1, dtype=np.float32)
-    if waveform.ndim != 1 or sample_rate <= 0:
+    audio_info = sf.info(audio_path)
+    sample_rate = audio_info.samplerate
+    if audio_info.frames <= 0 or sample_rate <= 0:
         raise AsmrDubberError("Qwen3 ForcedAligner 无法读取台本对齐音频。")
-    duration = len(waveform) / sample_rate
+    duration = audio_info.frames / sample_rate
 
     # Leave 30 seconds on each side for dialogue-density differences while
     # keeping every crop within the model's documented 300-second limit.
@@ -283,7 +287,7 @@ def align_script_sentences_with_qwen(
                 crop_start += excess / 2
                 crop_end -= excess - (excess / 2)
             start_sample = max(0, int(crop_start * sample_rate))
-            end_sample = min(len(waveform), int(np.ceil(crop_end * sample_rate)))
+            end_sample = min(audio_info.frames, int(np.ceil(crop_end * sample_rate)))
             if progress:
                 progress(
                     f"Qwen3 ForcedAligner 对齐台本 {group_index}/{len(groups)} 组",
@@ -301,7 +305,10 @@ def align_script_sentences_with_qwen(
             ]
             try:
                 aligned = model.align(
-                    audio=(waveform[start_sample:end_sample], sample_rate),
+                    audio=(
+                        _read_alignment_window(audio_path, start_sample, end_sample),
+                        sample_rate,
+                    ),
                     text=group_text,
                     language=qwen_language_name(source_language),
                 )

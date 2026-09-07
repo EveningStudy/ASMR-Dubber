@@ -16,7 +16,7 @@ Linux：
 bash scripts/linux/run-cli.sh --help
 ```
 
-使用这些脚本能保证便携 Python、FFmpeg、模型目录和隔离 DLL 路径正确。不要直接调用系统 `python -m asmr_dubber`，除非你正在开发并明确配置了环境。
+使用这些脚本能保证便携 Python、FFmpeg、模型目录和隔离 DLL 路径正确。不要直接调用未配置环境的 `python -m asmr_dubber.cli`，除非你正在开发并明确配置了环境。
 
 下面示例用 `<project>` 表示项目目录或其中的 `project.json`。
 
@@ -153,6 +153,7 @@ VAD（语音活动检测）、主识别器、多模型校对和 Qwen3 时间戳�
 .\scripts\windows\run-cli.ps1 install-backend kotoba_whisper
 .\scripts\windows\run-cli.ps1 install-backend faster_whisper
 .\scripts\windows\run-cli.ps1 install-backend indextts2
+.\scripts\windows\run-cli.ps1 install-backend indextts2_5
 ```
 
 后端 ID 是稳定的项目字段，不是网页显示名称。Edge TTS 随基础依赖安装；MiMo、MiniMax、GPT-SoVITS、CosyVoice 和 Fish API 不通过此命令安装。
@@ -194,6 +195,7 @@ VAD（语音活动检测）、主识别器、多模型校对和 Qwen3 时间戳�
 ```text
 parakeet-ja-windows
 indextts2-checkpoints
+indextts2_5-checkpoints
 kotoba-whisper-v2.2
 faster-whisper-large-v2
 qwen3-forced-aligner
@@ -240,12 +242,12 @@ bash scripts/linux/run-cli.sh run /data/projects/<project>/project.json \
 
 `run` 会按顺序执行指定阶段；中文台本项目会自动跳过 ASR（语音识别）和翻译。可用阶段为 `analyze`、`translate`、`synthesize`、`mix` 和 `subtitles`。
 
-Linux 还提供设置命令，适合远程部署时不打开网页：
+Windows 和 Linux 都提供设置命令，适合远程部署时不打开网页：
 
 ```bash
 bash scripts/linux/run-cli.sh settings show
 bash scripts/linux/run-cli.sh settings set tts_backend edge_tts
-bash scripts/linux/run-cli.sh settings set-translation-key deepseek --key 'YOUR_KEY'
+bash scripts/linux/run-cli.sh settings set-translation-key deepseek
 ```
 
 不要把 API Key 写进 shell 历史或提交到服务器镜像；推荐通过交互式输入或服务器密钥管理器注入。
@@ -275,6 +277,18 @@ bash scripts/linux/run-ui.sh --host 0.0.0.0 --port 7860
 ```
 
 服务器部署建议优先使用 CLI；网页只监听内网地址，并通过 SSH 隧道、反向代理或 VPN 访问。程序不会自动把 WebUI 暴露到公网。
+
+## 批量与复核边界
+
+```powershell
+.\scripts\windows\run-cli.ps1 import-transcript '<project>' '.\subtitle.vtt' --kind zh
+.\scripts\windows\run-cli.ps1 batch 'D:\Media\Work' --mode audio --layout merged
+.\scripts\windows\run-cli.ps1 batch --help
+```
+
+完整中文字幕直接导入并跳过 ASR/正文翻译，标题翻译另设。重做和覆盖前先备份，见[字幕制作](SUBTITLE_WORKFLOW.md)。`analyze --force` 不会绕过人工确认锁定，须先在网页明确解除。
+
+只重试音频复核、采纳/撤销提案、独立复核对齐目前通过网页提供，没有同名公开 CLI 命令。密钥设置省略 `--key` 会隐藏输入，不要把真实 Key 写入命令历史。
 
 ## 退出码和错误
 

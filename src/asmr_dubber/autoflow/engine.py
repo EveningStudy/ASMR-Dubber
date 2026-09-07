@@ -14,7 +14,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import redirect_stderr, redirect_stdout, suppress
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
@@ -39,6 +39,17 @@ from .catalog import (
     natural_key,
     scan_work,
 )
+from .domain import (
+    REFERENCE_SELECTION_TIMEOUT_SECONDS,
+    TRANSCRIPT_MODE_DIRECT,
+    AppConfig,
+    AudioSource,
+    QueuedSmartWork,
+    SmartPlanDefaults,
+    SmartPlanDraft,
+    SmartTaskPlan,
+    ToolPaths,
+)
 
 # AutoFlow is part of the main application now.  Its resumable state remains
 # below the portable application home, never beside package source files or in
@@ -59,7 +70,6 @@ VIDEO_SIZE = "1920x1080"
 VIDEO_FILTER_SIZE = "1920:1080"
 VIDEO_FPS = 5
 KEYFRAME_INTERVAL_SECONDS = 10
-REFERENCE_SELECTION_TIMEOUT_SECONDS = 5 * 60
 TIMESTAMP_SCHEMA = 2
 LAST_OPTIONS_SCHEMA = 1
 FAILED_TASKS_SCHEMA = 1
@@ -99,7 +109,6 @@ LAYOUT_ALIASES = {
     "both": LAYOUT_BOTH,
 }
 
-TRANSCRIPT_MODE_DIRECT = "direct"
 TRANSCRIPT_MODE_ASR_RECONCILE = "asr_reconcile"
 TRANSCRIPT_MODES = {TRANSCRIPT_MODE_DIRECT, TRANSCRIPT_MODE_ASR_RECONCILE}
 
@@ -143,113 +152,6 @@ DEFAULT_TIMESTAMP_FOOTER = """双语音声制作器：BV1f43G6YEov
 
 class VideoPreparerError(ProjectError):
     pass
-
-
-@dataclass(frozen=True)
-class AppConfig:
-    asmr_root: Path | None
-    harmonized_volume_db: float
-    harmonized_delay_seconds: int
-    timestamp_footer: str
-    output_folder_name: str = "AutoFlow输出"
-    default_output_layout: str = "ask"
-    preferred_audio_formats: tuple[str, ...] = (".wav", ".flac", ".ape", ".m4a", ".mp3")
-    bonus_policy: str = "ask"
-    background_policy: str = "ask"
-    reference_wait_seconds: int = REFERENCE_SELECTION_TIMEOUT_SECONDS
-
-
-@dataclass(frozen=True)
-class ToolPaths:
-    asmr_root: Path
-    asmr_home: Path
-    python: Path
-    ffmpeg: Path
-    cli_command: tuple[str, ...]
-    ui_command: tuple[str, ...]
-    powershell: str | None
-    video_encoder_options: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class AudioSource:
-    order: int
-    path: Path
-    title_ja: str
-    size: int
-    mtime_ns: int
-    relative_path: str = ""
-    category: str = "main"
-    transcript_path: Path | None = None
-    transcript_language: str | None = None
-    transcript_timed: bool = False
-    transcript_mode: str = TRANSCRIPT_MODE_DIRECT
-    source_language: str = "ja"
-
-
-@dataclass(frozen=True)
-class SmartTaskPlan:
-    """A fully configured smart-scan task that has not started processing yet."""
-
-    folder: Path
-    output_root: Path
-    edition_label: str
-    sources: tuple[AudioSource, ...]
-    edition: dict[str, Any]
-    mode: str
-    layout: str
-    background: Path | None
-    embed_subtitles: bool
-    plan_id: str
-    rebuild: bool
-    force: bool
-    retry_of: str | None = None
-    translate_work_title: bool = True
-    translate_track_titles: bool = True
-    subtitles_only: bool = False
-
-
-@dataclass(frozen=True)
-class SmartPlanDefaults:
-    """Reusable choices inherited by the next work and the next app launch."""
-
-    mode: str
-    video_mode: str
-    layout: str
-    include_bonus: bool
-    background_choice: str
-    background_relative: str | None
-    embed_subtitles: bool
-    edition_extension: str | None = None
-    edition_language: str | None = None
-    edition_mix_variant: str | None = None
-    edition_orientation: str | None = None
-
-
-@dataclass
-class SmartPlanDraft:
-    folder: Path
-    output_root: Path
-    scan: ScanResult
-    edition_label: str
-    sources: list[AudioSource]
-    edition: dict[str, Any]
-    include_bonus: bool
-    mode: str
-    video_mode: str
-    layout: str
-    background: Path | None
-    background_choice: str
-    background_relative: str | None
-    embed_subtitles: bool
-    transcript_choices: dict[str, str]
-
-
-@dataclass
-class QueuedSmartWork:
-    draft: SmartPlanDraft
-    plan: SmartTaskPlan
-    defaults: SmartPlanDefaults
 
 
 def print_header() -> None:
@@ -566,6 +468,12 @@ def find_tool_paths(config: AppConfig) -> ToolPaths:
             asmr_root / ".venv" / "bin" / "python",
         )
     python = next((path for path in python_candidates if path.is_file()), None)
+    if (
+        python is None
+        and (asmr_root / "src" / "asmr_dubber").resolve() == Path(__file__).resolve().parents[1]
+    ):
+        # Editable installs may deliberately keep their venv outside the repository.
+        python = Path(sys.executable)
     if python is None:
         raise VideoPreparerError("ASMR Dubber 尚未安装完整运行环境，找不到便携 Python。")
 
@@ -1241,8 +1149,8 @@ def fingerprint(audio: Iterable[AudioSource], background: Path | None) -> dict[s
                 "order": item.order,
                 "path": str(item.path),
                 "relative_path": item.relative_path,
-                "size": item.size,
-                "mtime_ns": item.mtime_ns,
+                "size": item.path.stat().st_size,
+                "mtime_ns": item.path.stat().st_mtime_ns,
                 "category": item.category,
                 "transcript": file_stat_payload(item.transcript_path),
                 "transcript_language": item.transcript_language,
@@ -1505,6 +1413,7 @@ def run_process(arguments: list[str], *, cwd: Path | None = None) -> None:
     try:
         process = subprocess.Popen(
             arguments,
+            start_new_session=os.name != "nt",
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1541,6 +1450,7 @@ def run_process_captured(arguments: list[str], *, cwd: Path | None = None) -> st
         log_event("运行命令：" + " ".join(str(item) for item in arguments))
         process = subprocess.Popen(
             arguments,
+            start_new_session=os.name != "nt",
             cwd=cwd,
             env=environment,
             stdout=subprocess.PIPE,
@@ -2262,9 +2172,13 @@ def _replace_project_with_timed_transcripts(
             duration = int(item["duration_samples"]) / SAMPLE_RATE
             parsed = _load_transcript_sentences(
                 Path(str(item["transcript"])),
-                language=language,
+                language=cast(
+                    Literal["ja", "en", "zh"], item.get("transcript_language") or language
+                ),
                 duration_seconds=duration,
             )
+            if not parsed.timed:
+                raise VideoPreparerError("所选文件没有有效时间戳；停止导入，不自动改用 ASR。")
             offset = int(item["start_samples"]) / SAMPLE_RATE
             for sentence in parsed.sentences:
                 copied = sentence.model_copy(deep=True)
@@ -2351,7 +2265,9 @@ def import_available_source_transcript(
     ):
         return {"kind": "reconcile_after_asr", "count": len(usable)}
 
-    # 合并模式只有在每一轨都有同语言的时间轴字幕时才直接替代 ASR。
+    # Coverage is per track, not the fraction of silence spanned by cues or
+    # agreement of language labels. Chinese rows already have zh_text and
+    # translation will process only untranslated source-language rows.
     if len(usable) != len(timeline):
         if any(
             str(item.get("transcript_language") or "") == "zh"
@@ -2362,16 +2278,13 @@ def import_available_source_transcript(
             return {"kind": "zh_overlay_partial", "count": len(usable)}
         return {"kind": "partial", "count": len(usable)}
     languages = {str(item["transcript_language"]) for item in usable}
-    if len(languages) != 1 or not all(bool(item.get("transcript_timed")) for item in usable):
-        if any(
-            str(item.get("transcript_language") or "") == "zh"
-            and bool(item.get("transcript_timed"))
-            and str(item.get("transcript_mode") or TRANSCRIPT_MODE_DIRECT) == TRANSCRIPT_MODE_DIRECT
-            for item in usable
-        ):
-            return {"kind": "zh_overlay_partial", "count": len(usable)}
-        return {"kind": "partial", "count": len(usable)}
-    language = cast(Literal["ja", "en", "zh"], languages.pop())
+    untranslated_languages = languages - {"zh"}
+    if len(untranslated_languages) > 1:
+        raise VideoPreparerError(
+            "所有音轨已有字幕，但日文和英文字幕混合。请统一字幕语言标记或分轨处理；"
+            "不会丢弃字幕重新识别。中文字幕可与一种原文语言混合。"
+        )
+    language = cast(Literal["ja", "en", "zh"], next(iter(untranslated_languages), "zh"))
     sentence_count = _replace_project_with_timed_transcripts(
         project_json,
         timeline,
@@ -4996,6 +4909,23 @@ def execute_task(
     project_json = Path(state["project_json"])
     if not project_json.is_file() and not status_at_least(state, "outputs_ready"):
         raise VideoPreparerError(f"ASMR Dubber 项目已经不存在：{project_json}")
+    old_import = state.get("transcript_import") or {}
+    current_timeline = list(state.get("timeline") or [])
+    if (
+        old_import.get("kind") in {"partial", "zh_overlay_partial"}
+        and current_timeline
+        and all(
+            item.get("transcript")
+            and item.get("transcript_timed")
+            and item.get("transcript_language") in {"zh", "ja", "en"}
+            and item.get("transcript_mode", TRANSCRIPT_MODE_DIRECT) == TRANSCRIPT_MODE_DIRECT
+            for item in current_timeline
+        )
+    ):
+        raise VideoPreparerError(
+            "此任务由旧版完整字幕误回退流程创建，不能继续复用 ASR/翻译结果。"
+            "请重新扫描，确认每轨字幕语言后，显式选择重做；旧项目与成品尚未修改。"
+        )
 
     if legacy_chinese_timeline_needs_reimport(state):
         reset_legacy_chinese_timeline_state(state)

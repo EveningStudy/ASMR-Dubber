@@ -58,6 +58,40 @@ INDEXTTS_REQUIRED_FILES = frozenset(
 )
 INDEXTTS_REQUIRED_DIRS = frozenset({"qwen0.6bemo4-merge", "hf_cache/w2v-bert-2.0"})
 
+DEFAULT_INDEXTTS25_ROOT = DEFAULT_RUNTIMES_DIR / "index-tts-2.5"
+DEFAULT_INDEXTTS25_MODEL_DIR = DEFAULT_INDEXTTS25_ROOT / "checkpoints"
+DEFAULT_INDEXTTS25_CONFIG = DEFAULT_INDEXTTS25_MODEL_DIR / "config.yaml"
+INDEXTTS25_REQUIRED_FILES = frozenset(
+    {
+        "config.yaml",
+        "codec.pth",
+        "gpt.pth",
+        "s2mel.pth",
+        "wav2vec2bert_stats.pt",
+        "feat1.pt",
+        "feat2.pt",
+        "multilingual_zh_ja_yue_char_del.tiktoken",
+        "hf_cache/semantic_codec_model.safetensors",
+        "hf_cache/campplus_cn_common.bin",
+        "hf_cache/bigvgan/config.json",
+        "hf_cache/bigvgan/bigvgan_generator.pt",
+    }
+)
+INDEXTTS25_REQUIRED_DIRS = frozenset({"qwen0.6bemo4-merge", "hf_cache/w2v-bert-2.0"})
+
+_INDEX_AUXILIARY_FILES = frozenset(
+    {
+        "qwen0.6bemo4-merge/config.json",
+        "qwen0.6bemo4-merge/model.safetensors",
+        "qwen0.6bemo4-merge/tokenizer.json",
+        "hf_cache/w2v-bert-2.0/config.json",
+        "hf_cache/w2v-bert-2.0/model.safetensors",
+        "hf_cache/w2v-bert-2.0/preprocessor_config.json",
+    }
+)
+INDEXTTS_REQUIRED_FILES |= _INDEX_AUXILIARY_FILES
+INDEXTTS25_REQUIRED_FILES |= _INDEX_AUXILIARY_FILES
+
 # Pin the exact model snapshots validated for this release. Project manifests keep the
 # human-readable repository ids, while loaders resolve these revisions from the
 # local Hugging Face cache whenever they are available.

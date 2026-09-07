@@ -38,6 +38,9 @@ fallbacks = {
     "indextts2_source_archives": [
         "https://github.com/index-tts/index-tts/archive/13495845e3028f0bb6ca1462ad22aa0e76349e40.zip"
     ],
+    "indextts25_source_archives": [
+        "https://github.com/index-tts/index-tts/archive/ee40fa7d6c6b8a2c7f06105f9f1e65775b74868c.zip"
+    ],
 }
 raw_allow = os.getenv("ASMR_DUBBER_ALLOW_EXTERNAL_DOWNLOADS")
 policy = payload.get("download_policy")

@@ -46,6 +46,12 @@ function Repair-ASMRDubberPortablePythonPaths {
             PythonPattern = "cpython-3.11.*-windows-x86_64-none"
             EditablePattern = "_editable_impl_indextts.pth"
             EditableTarget = Join-Path $RuntimeRoot "index-tts"
+        },
+        @{
+            Venv = Join-Path $RuntimeRoot "index-tts-2.5\.venv"
+            PythonPattern = "cpython-3.11.*-windows-x86_64-none"
+            EditablePattern = "_editable_impl_indextts.pth"
+            EditableTarget = Join-Path $RuntimeRoot "index-tts-2.5"
         }
     )
 

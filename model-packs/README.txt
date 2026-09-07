@@ -1,6 +1,10 @@
 ASMR Dubber 离线模型包目录
 ==========================
 
+本文面向当前开发工作树，正式下载包请核对 docs/RELEASE.md。
+IndexTTS-2.5 为按需安装项，不属于下方进阶清单。
+完整说明见 docs/INSTALLATION.md 和 docs/MODELSCOPE_UPLOADS.md。
+
 把 ASMR Dubber 格式的模型 ZIP 原样放在这里。不要解压、改名或修改包内 manifest。
 
 导入方法：

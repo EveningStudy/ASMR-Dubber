@@ -1,6 +1,10 @@
 import pytest
 
-from asmr_dubber.filtering import implausible_asr_reason, is_japanese_filler_only
+from asmr_dubber.filtering import (
+    has_speakable_text,
+    implausible_asr_reason,
+    is_japanese_filler_only,
+)
 
 
 @pytest.mark.parametrize(
@@ -47,3 +51,13 @@ def test_impossible_asr_text_density_is_flagged() -> None:
 
 def test_fast_but_plausible_asr_sentence_is_kept() -> None:
     assert implausible_asr_reason("今日は一緒に始めましょう", 1.2) is None
+
+
+@pytest.mark.parametrize("text", ["", "   ", "……", "——", "?!。", "😊🌸", "『……』"])
+def test_non_lexical_tts_text_is_not_speakable(text: str) -> None:
+    assert not has_speakable_text(text)
+
+
+@pytest.mark.parametrize("text", ["你好……", "Hello!", "123", "１号", "καλημέρα"])
+def test_letters_and_numbers_are_speakable(text: str) -> None:
+    assert has_speakable_text(text)

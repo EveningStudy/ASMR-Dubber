@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import unicodedata
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from .asr import transcribe_source
-from .asr_review import review_transcriptions
+from .asr_review import run_audio_review
 from .audio import (
     build_chinese_stem,
     copy_source_verbatim,
@@ -28,9 +29,10 @@ from .audio import (
 )
 from .constants import DEFAULT_PROJECTS_DIR
 from .errors import ProjectError, SynthesisError
-from .filtering import implausible_asr_reason, is_japanese_filler_only
+from .filtering import has_speakable_text, implausible_asr_reason, is_japanese_filler_only
 from .forced_alignment import align_script_sentences_with_qwen, align_sentences_with_qwen
 from .languages import SourceLanguage, source_language_label
+from .lifecycle import invalidate_outputs, project_operation
 from .models import (
     DubProject,
     ProjectSettings,
@@ -51,7 +53,7 @@ from .translation import (
     reconcile_script_sentences,
     translate_sentences,
 )
-from .tts import synthesize_sentences, tts_cache_key
+from .tts import synthesize_sentences, tts_cache_key, valid_tts_cache
 from .user_settings import PROVIDER_PRESETS, resolve_api_key
 
 Progress = Callable[[str, int, int], None]
@@ -116,7 +118,7 @@ def output_filename(project: DubProject, project_dir: Path) -> str:
     model_label = Path(project.settings.tts_model.replace("\\", "/")).name
     reference_label = (
         f"{project.settings.tts_index_speaker_source}-{project.settings.tts_index_emotion_source}"
-        if project.settings.tts_backend == "indextts2"
+        if project.settings.tts_backend in {"indextts2_5", "indextts2"}
         else project.settings.tts_clone_mode
     )
     tts_label = _safe_name(f"{project.settings.tts_backend}-{model_label}-{reference_label}")
@@ -305,6 +307,7 @@ def _reconcile_untimed_script(
         return [item.model_copy(deep=True) for item in working.sentences], report
 
 
+@project_operation
 def reconcile_analyzed_project_script(
     project: DubProject,
     project_dir: Path,
@@ -427,6 +430,7 @@ def reconcile_analyzed_project_script(
     }
 
 
+@project_operation
 def import_project_transcript(
     project: DubProject,
     project_dir: Path,
@@ -558,6 +562,10 @@ def _analyze_project_impl(
     if project.source_language == "zh":
         raise ProjectError("中文台本项目不需要运行 ASR（语音识别）。")
     project.settings = settings_for_source_language(project.settings, project.source_language)
+    if force and any(row.review_locked for row in project.sentences):
+        raise ProjectError(
+            "项目包含人工确认的句子。请先在复核面板解除确认锁定，再重跑 ASR；也可只重试复核。"
+        )
     if project.sentences and not force:
         if progress:
             progress(f"已存在 {len(project.sentences)} 句识别缓存", 1, 1)
@@ -572,82 +580,7 @@ def _analyze_project_impl(
         progress=progress,
         **cancel_kwargs,
     )
-    if project.settings.asr_review_enabled:
-        transcriptions: list[tuple[str, list[Sentence]]] = [
-            (
-                f"{project.settings.asr_backend}|{project.settings.asr_model}",
-                sentences,
-            )
-        ]
-        selected: list[tuple[str, str]] = []
-        for value in project.settings.asr_review_models:
-            backend, separator, model = str(value).partition("|")
-            if not separator or not backend.strip() or not model.strip():
-                raise ProjectError(f"多 ASR（语音识别）模型配置无效：{value}")
-            pair = (backend.strip(), model.strip())
-            if pair not in selected:
-                selected.append(pair)
-        primary_pair = (project.settings.asr_backend, project.settings.asr_model)
-        comparison = [pair for pair in selected if pair != primary_pair]
-        total_models = len(comparison) + 1
-        for model_index, (backend, model) in enumerate(comparison, start=2):
-            check_cancelled(cancel_event)
-            if progress:
-                progress(
-                    f"多 ASR（语音识别）候选 {model_index}/{total_models}：{backend} · {model}",
-                    model_index - 1,
-                    total_models,
-                )
-            candidate_payload = project.settings.model_dump()
-            candidate_payload.update(
-                asr_backend=backend,
-                asr_model=model,
-                asr_review_enabled=False,
-            )
-            candidate_settings = ProjectSettings.model_validate(candidate_payload)
-            candidate_sentences, _ = transcribe_source(
-                analysis,
-                candidate_settings,
-                source_language=project.source_language,
-                progress=progress,
-                **cancel_kwargs,
-            )
-            transcriptions.append((f"{backend}|{model}", candidate_sentences))
-        candidates_path = project_dir / "analysis" / "asr_candidates.json"
-        candidates_path.write_text(
-            json.dumps(
-                {
-                    "audio": str(analysis.relative_to(project_dir)),
-                    "models": [
-                        {
-                            "source": label,
-                            "sentences": [item.model_dump() for item in items],
-                        }
-                        for label, items in transcriptions
-                    ],
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        review_cancel_kwargs = {"cancel_event": cancel_event} if cancel_event is not None else {}
-        sentences = review_transcriptions(
-            transcriptions,
-            project.settings,
-            project_dir / "analysis" / "asr_review.json",
-            analysis_audio=analysis,
-            source_language=project.source_language,
-            progress=progress,
-            **review_cancel_kwargs,
-        )
-        check_cancelled(cancel_event)
-        language = f"{source_language_label(project.source_language)}（多模型校对）"
-    already_qwen_aligned = (
-        project.settings.asr_review_enabled
-        and project.settings.asr_review_timestamp_priority_model.startswith("qwen_forced_aligner|")
-    )
-    if project.settings.asr_forced_alignment_enabled and not already_qwen_aligned:
+    if project.settings.asr_forced_alignment_enabled:
         alignment_report = align_sentences_with_qwen(
             analysis,
             sentences,
@@ -713,6 +646,29 @@ def _analyze_project_impl(
     save_project(project, project_dir)
     export_transcript(project, project_dir)
 
+    if project.settings.asr_review_enabled:
+        # Commit the usable single-model baseline before optional reviewers run.
+        from .storage import atomic_write_text
+
+        baseline = [row.model_copy(deep=True) for row in project.sentences]
+        snapshot = project_dir / "analysis" / f"asr-baseline-r{project.revision}.json"
+        atomic_write_text(
+            snapshot,
+            json.dumps([row.model_dump() for row in baseline], ensure_ascii=False, indent=2),
+        )
+        project.sentences = run_audio_review(
+            analysis,
+            baseline,
+            project.settings,
+            project_dir / "analysis" / "asr_review.json",
+            source_language=project.source_language,
+            progress=progress,
+            cancel_event=cancel_event,
+        )
+        project.asr_language = f"{language}（音频片段复核；主稿独立保留）"
+        save_project(project, project_dir)
+        export_transcript(project, project_dir)
+
 
 def _analyze_project_unlocked(
     project: DubProject,
@@ -741,6 +697,7 @@ def _analyze_project_unlocked(
         metrics["sentences"] = len(project.sentences)
 
 
+@project_operation
 def analyze_project(
     project: DubProject,
     project_dir: Path,
@@ -775,6 +732,8 @@ def _translate_project_impl(
     )
     if force:
         for sentence in project.sentences:
+            if not sentence.enabled:
+                continue
             sentence.zh_text = ""
             sentence.tts_file = None
             sentence.tts_cache_key = None
@@ -824,6 +783,7 @@ def _translate_project_impl(
     checkpoint()
 
 
+@project_operation
 def translate_project(
     project: DubProject,
     project_dir: Path,
@@ -852,6 +812,7 @@ def translate_project(
         metrics["translated_after"] = sum(bool(sentence.zh_text) for sentence in project.sentences)
 
 
+@project_operation
 def _synthesize_project_impl(
     project: DubProject,
     project_dir: Path,
@@ -869,14 +830,14 @@ def _synthesize_project_impl(
         and sentence.zh_text
         and (requested is None or sentence.id in requested)
         and (
-            force
-            or not sentence.tts_file
-            or not project_file_exists(
-                project_dir,
-                sentence.tts_file,
-                f"句子 {sentence.id} 的中文音频",
+            (
+                has_speakable_text(sentence.zh_text)
+                and (force or not valid_tts_cache(project, sentence, project_dir))
             )
-            or sentence.tts_cache_key != tts_cache_key(project, sentence)
+            or (
+                not has_speakable_text(sentence.zh_text)
+                and (sentence.tts_file is not None or sentence.status != "skipped_tts")
+            )
         )
         for sentence in project.sentences
     )
@@ -885,10 +846,17 @@ def _synthesize_project_impl(
         project.output_file = None
         project.output_video_file = None
         project.subtitle_video_file = None
+        if project.settings.subtitle_timeline == "dubbing":
+            invalidate_outputs(project, audio=False)
+
+    last_checkpoint = 0.0
 
     def checkpoint() -> None:
-        save_project(project, project_dir)
-        export_transcript(project, project_dir)
+        nonlocal last_checkpoint
+        now = time.monotonic()
+        if now - last_checkpoint >= 2.0:
+            save_project(project, project_dir)
+            last_checkpoint = now
 
     cancel_kwargs = {"cancel_event": cancel_event} if cancel_event is not None else {}
     failures = synthesize_sentences(
@@ -901,7 +869,8 @@ def _synthesize_project_impl(
         on_sentence=checkpoint,
         **cancel_kwargs,
     )
-    checkpoint()
+    save_project(project, project_dir)
+    export_transcript(project, project_dir)
     if failures:
         preview = "\n".join(failures[:12])
         remainder = f"\n另有 {len(failures) - 12} 句失败" if len(failures) > 12 else ""
@@ -928,7 +897,10 @@ def _synthesize_project_unlocked(
         requested_sentences=(
             len(sentence_ids)
             if sentence_ids is not None
-            else sum(sentence.enabled and bool(sentence.zh_text) for sentence in project.sentences)
+            else sum(
+                sentence.enabled and has_speakable_text(sentence.zh_text)
+                for sentence in project.sentences
+            )
         ),
     ) as metrics:
         before = sum(
@@ -959,6 +931,7 @@ def _synthesize_project_unlocked(
         metrics["available_after"] = after
 
 
+@project_operation
 def synthesize_project(
     project: DubProject,
     project_dir: Path,
@@ -992,6 +965,7 @@ def _mix_project_impl(
         for sentence in project.sentences
         if sentence.enabled
         and sentence.zh_text
+        and has_speakable_text(sentence.zh_text)
         and (not sentence.tts_file or sentence.tts_cache_key != tts_cache_key(project, sentence))
     ]
     if missing:
@@ -1089,6 +1063,7 @@ def _mix_project_impl(
     return mixed_output or stem
 
 
+@project_operation
 def mix_project(
     project: DubProject,
     project_dir: Path,
@@ -1129,6 +1104,7 @@ def mix_project(
         return output
 
 
+@project_operation
 def generate_subtitles(
     project: DubProject,
     project_dir: Path,

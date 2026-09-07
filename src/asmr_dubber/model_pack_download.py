@@ -99,6 +99,12 @@ REMOTE_MODEL_PACKS: dict[str, RemoteModelPack] = {
         size=11_189_524_132,
         sha256="144aa91c4de24faf8d415df4fa4324b831609c4bbcef4406a5db4f2a952e108e",
     ),
+    "indextts2_5-checkpoints": RemoteModelPack(
+        pack_id="indextts2_5-checkpoints",
+        filename="ASMR-Dubber-ModelPack-indextts2_5-checkpoints-v1.0.0.zip",
+        size=10_784_385_694,
+        sha256="602f719a8bdae3c81b348590c8acb2618c66a4c42180eb08a0463fbaa9a039b9",
+    ),
     "kotoba-whisper-v2.2": RemoteModelPack(
         pack_id="kotoba-whisper-v2.2",
         filename="ASMR-Dubber-ModelPack-kotoba-whisper-v2.2-v1.0.0.zip",

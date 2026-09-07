@@ -12,6 +12,8 @@ from typer.testing import CliRunner
 from asmr_dubber import cli as cli_module
 from asmr_dubber import environment
 from asmr_dubber.constants import (
+    INDEXTTS25_REQUIRED_DIRS,
+    INDEXTTS25_REQUIRED_FILES,
     INDEXTTS_REQUIRED_DIRS,
     INDEXTTS_REQUIRED_FILES,
     OPTIONAL_ASR_MODEL_REVISIONS,
@@ -368,6 +370,42 @@ def test_indextts_model_pack_definition_covers_every_required_resource(
 
     assert {prefix + name for name in INDEXTTS_REQUIRED_FILES} <= targets
     for name in INDEXTTS_REQUIRED_DIRS:
+        assert any(target.startswith(prefix + name + "/") for target in targets)
+
+
+def test_indextts25_model_pack_definition_covers_every_required_resource(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "portable"
+    checkpoints = home / "runtimes/index-tts-2.5/checkpoints"
+    for relative in INDEXTTS25_REQUIRED_FILES:
+        target = checkpoints / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"checkpoint")
+    for relative in INDEXTTS25_REQUIRED_DIRS:
+        required_dir = checkpoints / relative
+        required_dir.mkdir(parents=True, exist_ok=True)
+        (required_dir / "test-resource.bin").write_bytes(b"checkpoint directory")
+
+    script = Path(__file__).parents[1] / "scripts/create-model-packs.py"
+    namespace = runpy.run_path(str(script))
+    sources_for_pack = namespace["_sources"]
+    sources_for_pack.__globals__["portable_home"] = lambda: home
+    sources = sources_for_pack("indextts2_5-checkpoints")
+    manifest = build_model_pack(
+        tmp_path / "indextts25.zip",
+        pack_id="indextts2_5-checkpoints",
+        display_name="IndexTTS-2.5 test pack",
+        pack_version="0.0.0",
+        platforms=(current_platform().id,),
+        architectures=("any",),
+        sources=sources,
+    )
+    targets = {file.path for file in manifest.files}
+    prefix = "runtimes/index-tts-2.5/checkpoints/"
+
+    assert {prefix + name for name in INDEXTTS25_REQUIRED_FILES} <= targets
+    for name in INDEXTTS25_REQUIRED_DIRS:
         assert any(target.startswith(prefix + name + "/") for target in targets)
 
 

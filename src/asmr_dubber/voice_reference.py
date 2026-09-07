@@ -5,7 +5,11 @@ import json
 import logging
 import math
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from heapq import nlargest
 from pathlib import Path
 
 import soundfile as sf
@@ -25,6 +29,33 @@ _INDEX_REFERENCE_CACHE_VERSION = "index-reference-v3-quality-fallback"
 _INDEX_REFERENCE_DURATION_TOLERANCE = 0.01
 _REFERENCE_TEXT = re.compile(r"[\w\u3040-\u30ff\u3400-\u9fff]", re.UNICODE)
 logger = logging.getLogger(__name__)
+_REFERENCE_SELECTION: ContextVar[tuple | None] = ContextVar("reference_selection", default=None)
+
+
+@contextmanager
+def reference_selection_scope(project: DubProject) -> Iterator[None]:
+    """Freeze an operation's reference lookup index, never cache across edits."""
+    active = _REFERENCE_SELECTION.get()
+    if active is not None and active[0] is project:
+        yield
+        return
+    by_id = {sentence.id: sentence for sentence in project.sentences}
+    candidates = [s for s in project.sentences if s.source_text.strip() or s.zh_text.strip()]
+    ranked = nlargest(
+        2,
+        candidates,
+        key=lambda s: (
+            s.end_seconds - s.start_seconds,
+            len(_REFERENCE_TEXT.findall(s.source_text or s.zh_text)),
+            -s.start_seconds,
+        ),
+    )
+    shared = shared_reference_sentence(project) if candidates else None
+    token = _REFERENCE_SELECTION.set((project, by_id, shared, ranked))
+    try:
+        yield
+    finally:
+        _REFERENCE_SELECTION.reset(token)
 
 
 @dataclass(frozen=True)
@@ -41,6 +72,11 @@ class VoiceReference:
 def shared_reference_sentence(project: DubProject) -> Sentence:
     """Resolve the frozen project-level voice anchor, or select one deterministically."""
     configured = project.settings.tts_reference_sentence_id
+    active = _REFERENCE_SELECTION.get()
+    if active is not None and active[0] is project:
+        selected = active[1].get(configured) if configured else active[2]
+        if selected is not None:
+            return selected
     if configured:
         for sentence in project.sentences:
             if sentence.id == configured:
@@ -65,6 +101,16 @@ def fallback_reference_sentence(project: DubProject, sentence: Sentence) -> Sent
     """Choose a deterministic project reference that is not the rejected sentence."""
 
     configured = project.settings.tts_reference_sentence_id
+    active = _REFERENCE_SELECTION.get()
+    if active is not None and active[0] is project:
+        selected = active[1].get(configured)
+        if (
+            selected is not None
+            and selected.id != sentence.id
+            and (selected.source_text.strip() or selected.zh_text.strip())
+        ):
+            return selected
+        return next((s for s in active[3] if s.id != sentence.id), None)
     if configured and configured != sentence.id:
         selected = next((item for item in project.sentences if item.id == configured), None)
         if selected is not None and (selected.source_text.strip() or selected.zh_text.strip()):
@@ -395,7 +441,7 @@ def prepare_index_emotion_reference(
     speaker_reference: VoiceReference,
 ) -> VoiceReference | None:
     source_id = project.settings.tts_index_emotion_source
-    if source_id == "text":
+    if source_id in {"text", "vector"}:
         return None
     if source_id == "speaker_reference":
         return speaker_reference

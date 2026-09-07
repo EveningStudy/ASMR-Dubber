@@ -268,7 +268,7 @@ def _track_items(scan: ScanResult, sources: list[engine.AudioSource]) -> list[di
         timing_choices = [
             {
                 "value": engine.TRANSCRIPT_MODE_DIRECT,
-                "label": "沿用文件时间轴",
+                "label": "完全采用字幕文字和时间轴（不运行 ASR）",
                 "selected": selected_mode == engine.TRANSCRIPT_MODE_DIRECT,
                 "disabled": not selected_timed,
             },
@@ -305,10 +305,23 @@ def _track_view(
 ) -> AutoFlowTrackView:
     normalized = _normalize_source_order(sources)
     matched = sum(source.transcript_path is not None for source in normalized)
+    complete_direct = bool(normalized) and all(
+        source.transcript_path is not None
+        and source.transcript_timed
+        and source.transcript_mode == engine.TRANSCRIPT_MODE_DIRECT
+        for source in normalized
+    )
+    guidance = ""
+    if complete_direct:
+        guidance = " 所有音轨已选择时间轴字幕：完全按字幕制作，不运行 ASR。" + (
+            "全部标为中文，不翻译字幕正文，直接配音。"
+            if all(source.transcript_language == "zh" for source in normalized)
+            else "中文部分直接配音；仅翻译标为日文/英文的字幕正文，请核对每轨语言。"
+        )
     return AutoFlowTrackView(
         source_payloads=_source_payloads(normalized),
         track_items=_track_items(scan, normalized),
-        summary=f"{prefix}：{len(normalized)} 条音轨，{matched} 条已选择台本或字幕。",
+        summary=f"{prefix}：{len(normalized)} 条音轨，{matched} 条已选择台本或字幕。" + guidance,
     )
 
 

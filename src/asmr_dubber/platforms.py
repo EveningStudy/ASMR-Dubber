@@ -151,6 +151,8 @@ def isolated_runtime_environment(runtime_name: str) -> dict[str, str]:
     # Batch TTS workers report one line per generated sentence.  Force Python
     # CLIs to flush those lines immediately so the UI can advance in real time.
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     if current_platform().is_windows:
         roaming = state_root / "Roaming"
         local = state_root / "Local"

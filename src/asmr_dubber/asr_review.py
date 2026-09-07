@@ -1,995 +1,675 @@
+"""Review identical audio windows; keep the baseline and propose reversible edits."""
+
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
-import time
-import unicodedata
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
-from difflib import SequenceMatcher
+import uuid
+from collections.abc import Callable, Iterator
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import httpx
+import numpy as np
+import soundfile as sf
 
-from .errors import AsmrDubberError
-from .forced_alignment import align_sentences_with_qwen
-from .languages import SourceLanguage, source_language_label
+from .asr_progress import model_heartbeat
+from .errors import OperationCancelledError, ProjectError
+from .hashing import cached_sha256_file
+from .languages import SourceLanguage
 from .models import ProjectSettings, Sentence
+from .storage import atomic_write_text, require_disk_space
 from .task_control import CancellationSignal, check_cancelled
-from .translation import LLMTranslator
-from .user_settings import PROVIDER_PRESETS, resolve_api_key
 
+REVIEW_VERSION = 2
 Progress = Callable[[str, int, int], None]
-_LLM_PROVIDERS = {
-    "deepseek",
-    "bailian",
-    "doubao",
-    "openai",
-    "anthropic",
-    "gemini",
-    "openai_compatible",
-    "sensenova",
-}
+WindowRunner = Callable[..., Iterator[tuple[str, list[Sentence] | None, str | None]]]
 
 
 @dataclass(frozen=True)
-class Evidence:
-    id: str
-    source: str
-    text: str
-    start: float
-    end: float
-
-
-@dataclass
-class ReviewWindow:
+class AudioWindow:
     id: str
     start: float
     end: float
-    evidence: list[Evidence] = field(default_factory=list)
+    audio_start: float
+    audio_end: float
+    boundary: str
 
 
-@dataclass(frozen=True)
-class ReviewCandidate:
-    text: str
-    evidence_ids: tuple[str, ...]
-    sources: tuple[str, ...]
-    families: tuple[str, ...]
+def normalize_text(text: str) -> str:
+    import unicodedata
+
+    value = unicodedata.normalize("NFKC", text).casefold()
+    value = re.sub(r"(?<!\d)\.(?=\s|$)", "", value)
+    # Signs, decimal points, apostrophes and lexical differences are meaningful.
+    value = re.sub(r"\s+", " ", value).strip()
+    value = "".join(c for c in value if c not in "。、!?！？")
+    return re.sub(r"(?<![a-z0-9]) | (?![a-z0-9])", "", value)
 
 
-@dataclass(frozen=True)
-class ReviewDecision:
-    text: str
-    evidence_ids: tuple[str, ...]
-    confidence: float
-    decision: str
-    reason: str
-    selected_candidate: int | None
+def _digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
 
 
-@dataclass(frozen=True)
-class FlattenedTranscript:
-    raw_text: str
-    normalized_text: str
-    raw_positions: tuple[int, ...]
-    token_starts: tuple[float, ...]
-    token_ends: tuple[float, ...]
-    sentence_ranges: tuple[tuple[int, int], ...]
+def source_family(source: str) -> str:
+    backend = source.partition("|")[0].casefold()
+    return "whisper" if "whisper" in backend else "parakeet" if "parakeet" in backend else backend
 
 
-_MIN_LLM_CONFIDENCE = 0.65
-_FUZZY_CONSENSUS_THRESHOLD = 0.84
-_ALIGNMENT_BLOCK_SECONDS = 60.0
-
-
-_SELECTION_CONTRACT = """硬性输出规则（优先级高于其它提示）：
-1. 你只能为每个目标窗口选择程序给出的候选序号，不得自由生成、改写、拼接或翻译文字。
-2. selected_candidate 使用每个窗口中从 1 开始的 candidate 编号；0 仅表示确定没有实义语音。
-3. 每个 target_window_id 恰好输出一项，顺序必须一致。
-4. 只输出严格 JSON：
-{"results":[{"window_id":"w000001","selected_candidate":1,"confidence":0.8}]}
-"""
-
-
-def _alignment_characters(text: str) -> list[str]:
-    normalized = unicodedata.normalize("NFKC", text).casefold()
-    return [
-        character
-        for character in normalized
-        if not character.isspace() and not unicodedata.category(character).startswith("P")
-    ]
-
-
-def _flatten_transcript(sentences: list[Sentence]) -> FlattenedTranscript:
-    raw_parts: list[str] = []
-    normalized: list[str] = []
-    raw_positions: list[int] = []
-    token_starts: list[float] = []
-    token_ends: list[float] = []
-    sentence_ranges: list[tuple[int, int]] = []
-    raw_offset = 0
-    for sentence_index, sentence in enumerate(sentences):
-        if sentence_index:
-            raw_parts.append("\n")
-            raw_offset += 1
-        text = sentence.source_text.strip()
-        raw_parts.append(text)
-        characters: list[tuple[str, int]] = []
-        for raw_index, raw_character in enumerate(text):
-            characters.extend(
-                (character, raw_offset + raw_index)
-                for character in _alignment_characters(raw_character)
-            )
-        token_start = len(normalized)
-        count = len(characters)
-        duration = max(0.0, sentence.end_seconds - sentence.start_seconds)
-        for character_index, (character, raw_position) in enumerate(characters):
-            normalized.append(character)
-            raw_positions.append(raw_position)
-            token_starts.append(sentence.start_seconds + duration * character_index / max(1, count))
-            token_ends.append(
-                sentence.start_seconds + duration * (character_index + 1) / max(1, count)
-            )
-        sentence_ranges.append((token_start, len(normalized)))
-        raw_offset += len(text)
-    return FlattenedTranscript(
-        raw_text="".join(raw_parts),
-        normalized_text="".join(normalized),
-        raw_positions=tuple(raw_positions),
-        token_starts=tuple(token_starts),
-        token_ends=tuple(token_ends),
-        sentence_ranges=tuple(sentence_ranges),
+def rows_fingerprint(rows: list[Sentence]) -> str:
+    return _digest(
+        [
+            {
+                k: row.model_dump()[k]
+                for k in (
+                    "id",
+                    "start_seconds",
+                    "end_seconds",
+                    "source_text",
+                    "zh_text",
+                    "enabled",
+                    "review_locked",
+                )
+            }
+            for row in rows
+        ]
     )
 
 
-def _project_boundary(
-    opcodes: Sequence[tuple[str, int, int, int, int]],
-    primary_index: int,
-    primary_length: int,
-    secondary_length: int,
-) -> int:
-    if primary_index <= 0:
-        return 0
-    if primary_index >= primary_length:
-        return secondary_length
-    for _tag, primary_start, primary_end, secondary_start, secondary_end in opcodes:
-        if primary_start <= primary_index < primary_end:
-            primary_span = primary_end - primary_start
-            if primary_span <= 0:
-                return secondary_start
-            ratio = (primary_index - primary_start) / primary_span
-            return round(secondary_start + ratio * (secondary_end - secondary_start))
-    return secondary_length
+def _write(path: Path, value: Any) -> None:
+    atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
-def _raw_fragment(transcript: FlattenedTranscript, start: int, end: int) -> str:
-    start = max(0, min(start, len(transcript.raw_positions)))
-    end = max(start, min(end, len(transcript.raw_positions)))
-    if start == end:
-        return ""
-    raw_start = transcript.raw_positions[start]
-    raw_end = (
-        transcript.raw_positions[end]
-        if end < len(transcript.raw_positions)
-        else len(transcript.raw_text)
-    )
-    while raw_end <= raw_start and end < len(transcript.raw_positions):
-        end += 1
-        raw_end = (
-            transcript.raw_positions[end]
-            if end < len(transcript.raw_positions)
-            else len(transcript.raw_text)
-        )
-    return " ".join(transcript.raw_text[raw_start:raw_end].split()).strip()
-
-
-def _temporal_token_range(
-    transcript: FlattenedTranscript,
-    start: float,
-    end: float,
-    max_drift_seconds: float,
-) -> tuple[int, int]:
-    matching = [
-        index
-        for index, (token_start, token_end) in enumerate(
-            zip(transcript.token_starts, transcript.token_ends, strict=True)
-        )
-        if token_end >= start - max_drift_seconds and token_start <= end + max_drift_seconds
-    ]
-    if not matching:
-        return (0, 0)
-    return matching[0], matching[-1] + 1
-
-
-def _project_source_to_primary_windows(
-    primary_sentences: list[Sentence],
-    secondary_sentences: list[Sentence],
-    max_drift_seconds: float,
-) -> list[tuple[str, float, float] | None]:
-    projected: list[tuple[str, float, float] | None] = []
-    block_start = 0
-    while block_start < len(primary_sentences):
-        block_end = block_start + 1
-        first_start = primary_sentences[block_start].start_seconds
-        while (
-            block_end < len(primary_sentences)
-            and primary_sentences[block_end].end_seconds - first_start <= _ALIGNMENT_BLOCK_SECONDS
-        ):
-            block_end += 1
-        primary_block_sentences = primary_sentences[block_start:block_end]
-        time_start = primary_block_sentences[0].start_seconds - max_drift_seconds
-        time_end = primary_block_sentences[-1].end_seconds + max_drift_seconds
-        secondary_block_sentences = [
-            sentence
-            for sentence in secondary_sentences
-            if sentence.end_seconds >= time_start and sentence.start_seconds <= time_end
-        ]
-        primary = _flatten_transcript(primary_block_sentences)
-        secondary = _flatten_transcript(secondary_block_sentences)
-        if not primary.normalized_text or not secondary.normalized_text:
-            projected.extend(None for _ in primary_block_sentences)
-            block_start = block_end
-            continue
-        opcodes = SequenceMatcher(
-            None,
-            primary.normalized_text,
-            secondary.normalized_text,
-            autojunk=False,
-        ).get_opcodes()
-        for sentence, (primary_start, primary_end) in zip(
-            primary_block_sentences, primary.sentence_ranges, strict=True
-        ):
-            secondary_start = _project_boundary(
-                opcodes,
-                primary_start,
-                len(primary.normalized_text),
-                len(secondary.normalized_text),
-            )
-            secondary_end = _project_boundary(
-                opcodes,
-                primary_end,
-                len(primary.normalized_text),
-                len(secondary.normalized_text),
-            )
-            if secondary_end <= secondary_start:
-                secondary_start, secondary_end = _temporal_token_range(
-                    secondary,
-                    sentence.start_seconds,
-                    sentence.end_seconds,
-                    max_drift_seconds,
+def plan_windows(audio: Path, seconds: float = 30.0, context: float = 0.5) -> list[AudioWindow]:
+    """Disjoint core intervals with acoustic overlap; quiet audio is never removed."""
+    if not 10 <= seconds <= 90 or not 0 <= context <= 3:
+        raise ValueError("Invalid audio review window settings")
+    windows = []
+    with sf.SoundFile(audio) as source:
+        rate = source.samplerate
+        duration = source.frames / rate
+        start = 0.0
+        while start < duration:
+            end = min(duration, start + seconds)
+            boundary = "end" if end == duration else "forced"
+            if end < duration:
+                lo, hi = max(start + seconds * 0.6, end - 4), min(duration, end + 4)
+                source.seek(round(lo * rate))
+                samples = source.read(round((hi - lo) * rate), dtype="float32", always_2d=True)
+                mono = samples.mean(axis=1)
+                step = max(1, round(rate * 0.1))
+                levels = np.array(
+                    [
+                        float(np.sqrt(np.mean(mono[i : i + step] ** 2)))
+                        for i in range(0, len(mono), step)
+                        if len(mono[i : i + step]) == step
+                    ]
                 )
-            text = _raw_fragment(secondary, secondary_start, secondary_end)
-            if not text:
-                projected.append(None)
-                continue
-            projected_start = secondary.token_starts[secondary_start]
-            projected_end = secondary.token_ends[secondary_end - 1]
-            distance = max(
-                0.0,
-                sentence.start_seconds - projected_end,
-                projected_start - sentence.end_seconds,
-            )
-            if distance > max_drift_seconds:
-                temporal_start, temporal_end = _temporal_token_range(
-                    secondary,
-                    sentence.start_seconds,
-                    sentence.end_seconds,
-                    max_drift_seconds,
-                )
-                temporal_text = _raw_fragment(secondary, temporal_start, temporal_end)
-                if not temporal_text:
-                    projected.append(None)
-                    continue
-                secondary_start, secondary_end, text = temporal_start, temporal_end, temporal_text
-                projected_start = secondary.token_starts[secondary_start]
-                projected_end = secondary.token_ends[secondary_end - 1]
-            projected.append((text, projected_start, projected_end))
-        block_start = block_end
-    return projected
-
-
-def _join_source_text(left: str, right: str) -> str:
-    left = left.strip()
-    right = right.strip()
-    if not left:
-        return right
-    if not right:
-        return left
-    return f"{left}{right}"
-
-
-def _stabilize_primary_sentences(sentences: list[Sentence]) -> list[Sentence]:
-    """Merge timestamp glitches that are too short to be useful review windows."""
-
-    stable = [sentence.model_copy(deep=True) for sentence in sentences]
-    while len(stable) > 1:
-        micro_index = next(
-            (
-                index
-                for index, sentence in enumerate(stable)
-                if sentence.end_seconds - sentence.start_seconds < 0.2
-            ),
-            None,
-        )
-        if micro_index is None:
-            break
-        if micro_index == 0:
-            merge_left = False
-        elif micro_index == len(stable) - 1:
-            merge_left = True
-        else:
-            previous_gap = max(
-                0.0, stable[micro_index].start_seconds - stable[micro_index - 1].end_seconds
-            )
-            next_gap = max(
-                0.0, stable[micro_index + 1].start_seconds - stable[micro_index].end_seconds
-            )
-            merge_left = previous_gap < next_gap
-        if merge_left:
-            target = stable[micro_index - 1]
-            source = stable[micro_index]
-            target.end_seconds = max(target.end_seconds, source.end_seconds)
-            target.source_text = _join_source_text(target.source_text, source.source_text)
-            stable.pop(micro_index)
-        else:
-            source = stable[micro_index]
-            target = stable[micro_index + 1]
-            target.start_seconds = min(source.start_seconds, target.start_seconds)
-            target.source_text = _join_source_text(source.source_text, target.source_text)
-            stable.pop(micro_index)
-    return stable
-
-
-def _build_windows(
-    transcriptions: list[tuple[str, list[Sentence]]],
-    max_drift_seconds: float,
-) -> list[ReviewWindow]:
-    if not transcriptions or not transcriptions[0][1]:
-        return []
-    primary_label, primary_sentences = transcriptions[0]
-    primary = _stabilize_primary_sentences(primary_sentences)
-    windows = [
-        ReviewWindow(id="", start=item.start_seconds, end=item.end_seconds) for item in primary
-    ]
-    for source_index, (label, sentences) in enumerate(transcriptions):
-        if source_index == 0:
-            projected = [
-                (sentence.source_text, sentence.start_seconds, sentence.end_seconds)
-                for sentence in primary
-            ]
-        else:
-            projected = _project_source_to_primary_windows(
-                primary,
-                sentences,
-                max_drift_seconds,
-            )
-        for window, candidate in zip(windows, projected, strict=True):
-            if candidate is None:
-                continue
-            text, start, end = candidate
-            window.evidence.append(
-                Evidence(
-                    id="",
-                    source=label if source_index else primary_label,
-                    text=text,
-                    start=start,
-                    end=end,
+                quiet = [
+                    i
+                    for i, level in enumerate(levels)
+                    if level <= min(0.003, max(1e-6, float(levels.max(initial=0)) * 0.15))
+                ]
+                if quiet:
+                    index = min(quiet, key=lambda i: abs(lo + (i + 0.5) * 0.1 - end))
+                    end = min(duration, lo + (index + 0.5) * 0.1)
+                    boundary = "quiet"
+            windows.append(
+                AudioWindow(
+                    f"w{len(windows) + 1:06d}",
+                    start,
+                    end,
+                    max(0.0, start - context),
+                    min(duration, end + context),
+                    boundary,
                 )
             )
-    for window_index, window in enumerate(windows, start=1):
-        window.id = f"w{window_index:06d}"
-        window.evidence = [
-            Evidence(
-                id=f"{window.id}-c{evidence_index:02d}",
-                source=evidence.source,
-                text=evidence.text,
-                start=evidence.start,
-                end=evidence.end,
-            )
-            for evidence_index, evidence in enumerate(window.evidence, start=1)
-        ]
+            start = end
     return windows
 
 
-def _window_payload(
-    window: ReviewWindow,
-    text_priority_source: str = "",
-    timestamp_priority_source: str = "",
+def _window_rows(rows: list[Sentence], window: AudioWindow) -> list[Sentence]:
+    return [
+        row for row in rows if row.end_seconds > window.start and row.start_seconds < window.end
+    ]
+
+
+def merge_boundary_windows(
+    windows: list[AudioWindow], baseline: list[Sentence], context: float
+) -> list[AudioWindow]:
+    """Merge adjacent audio units, never force a baseline sentence through a cut.
+
+    Bound merges to 90 s. Unresolvable coarse/incorrect baseline timestamps stay
+    visible as boundary proposals rather than being split by character counts.
+    """
+    merged = []
+    index = 0
+    while index < len(windows):
+        first = last = windows[index]
+        while index + 1 < len(windows):
+            crosses = any(
+                row.start_seconds < last.end + context and row.end_seconds > last.end - context
+                for row in baseline
+            )
+            following = windows[index + 1]
+            if not crosses or following.end - first.start > 90:
+                break
+            index += 1
+            last = following
+        merged.append(
+            AudioWindow(
+                f"w{len(merged) + 1:06d}",
+                first.start,
+                last.end,
+                first.audio_start,
+                last.audio_end,
+                last.boundary,
+            )
+        )
+        index += 1
+    return merged
+
+
+def _text(rows: list[Sentence], language: SourceLanguage) -> str:
+    return (" " if language == "en" else "").join(row.source_text.strip() for row in rows)
+
+
+def _candidate(
+    rows: list[Sentence], window: AudioWindow, source: str, language: SourceLanguage
 ) -> dict[str, Any]:
+    shifted = []
+    timing_warning = False
+    duration = window.audio_end - window.audio_start
+    for row in rows:
+        if not (
+            math.isfinite(row.start_seconds)
+            and math.isfinite(row.end_seconds)
+            and 0 <= row.start_seconds < row.end_seconds
+        ):
+            raise ValueError("Reviewer returned invalid timestamps")
+        if row.end_seconds > duration:
+            timing_warning = True
+        if row.start_seconds >= duration:
+            timing_warning = True
+            continue
+        shifted.append(
+            row.model_copy(
+                update={
+                    "start_seconds": row.start_seconds + window.audio_start,
+                    "end_seconds": min(window.audio_end, row.end_seconds + window.audio_start),
+                }
+            )
+        )
+    shifted.sort(key=lambda row: (row.start_seconds, row.end_seconds))
+    text = _text(rows, language)
     return {
-        "window_id": window.id,
-        "approximate_time": [round(window.start, 3), round(window.end, 3)],
-        "candidates": [
-            {
-                "id": item.id,
-                "source": item.source,
-                "family": _source_family(item.source),
-                "text": item.text,
-                "time": [round(item.start, 3), round(item.end, 3)],
-                "text_priority": item.source == text_priority_source,
-                "timestamp_priority": item.source == timestamp_priority_source,
-            }
-            for item in window.evidence
-        ],
+        "id": "c" + _digest(normalize_text(text))[:16],
+        "text": text,
+        "sources": [source],
+        "families": [source_family(source)],
+        "sentences": [row.model_dump() for row in shifted],
+        "timing_warning": timing_warning,
     }
 
 
-def _normalize_candidate_text(text: str) -> str:
-    """Normalize harmless presentation differences before deterministic voting."""
-    normalized = unicodedata.normalize("NFKC", text).casefold().strip()
-    return "".join(
-        character
-        for character in normalized
-        if not character.isspace() and not unicodedata.category(character).startswith("P")
-    )
+def sensitive_change(before: str, after: str) -> bool:
+    pattern = r"\d+(?:[.,]\d+)*|ない|ません|ぬ|禁止|いいえ|\b(?:not|no|never|don't|cannot|can't)\b"
+    return re.findall(pattern, before.casefold()) != re.findall(pattern, after.casefold())
 
 
-def _source_family(source: str) -> str:
-    backend = source.partition("|")[0].casefold().strip()
-    if "parakeet" in backend:
-        return "parakeet"
-    if "whisper" in backend:
-        return "whisper"
-    return backend or source.casefold().strip()
+def automatic_edit_allowed(before: str, after: str) -> bool:
+    """No learned calibration yet: only small non-deleting changes are eligible."""
+    from difflib import SequenceMatcher
+
+    original, proposed = normalize_text(before), normalize_text(after)
+    if sensitive_change(before, after) or not original or not proposed:
+        return False
+    if len(proposed) < len(original) * 0.8 or len(proposed) > len(original) * 1.2:
+        return False
+    return SequenceMatcher(None, original, proposed, autojunk=False).ratio() >= 0.8
 
 
-def _candidate_similarity(left: str, right: str) -> float:
-    left_normalized = _normalize_candidate_text(left)
-    right_normalized = _normalize_candidate_text(right)
-    if not left_normalized or not right_normalized:
-        return 0.0
-    if left_normalized == right_normalized:
-        return 1.0
-    shorter = min(len(left_normalized), len(right_normalized))
-    longer = max(len(left_normalized), len(right_normalized))
-    if shorter <= 3 or shorter / longer < 0.65:
-        return 0.0
-    return SequenceMatcher(
-        None,
-        left_normalized,
-        right_normalized,
-        autojunk=False,
-    ).ratio()
-
-
-def _candidate_quality(text: str) -> float:
-    normalized = _normalize_candidate_text(text)
-    if not normalized:
-        return -10.0
-    score = 0.0
-    if "�" in text:
-        score -= 4.0
-    if len(normalized) >= 12:
-        trigrams = [normalized[index : index + 3] for index in range(len(normalized) - 2)]
-        unique_ratio = len(set(trigrams)) / max(1, len(trigrams))
-        if unique_ratio < 0.7:
-            score -= (0.7 - unique_ratio) * 5.0
-    return score
-
-
-def _candidate_warning(text: str) -> str:
-    normalized = _normalize_candidate_text(text)
-    warnings: list[str] = []
-    if "�" in text:
-        warnings.append("包含解码异常字符")
-    if len(normalized) >= 12:
-        trigrams = [normalized[index : index + 3] for index in range(len(normalized) - 2)]
-        unique_ratio = len(set(trigrams)) / max(1, len(trigrams))
-        if unique_ratio < 0.7:
-            warnings.append("存在异常重复")
-    return "；".join(warnings)
-
-
-def _window_candidates(window: ReviewWindow) -> list[ReviewCandidate]:
-    evidence = [item for item in window.evidence if _normalize_candidate_text(item.text)]
-    parents = list(range(len(evidence)))
-
-    def root(index: int) -> int:
-        while parents[index] != index:
-            parents[index] = parents[parents[index]]
-            index = parents[index]
-        return index
-
-    def union(left: int, right: int) -> None:
-        left_root, right_root = root(left), root(right)
-        if left_root != right_root:
-            parents[right_root] = left_root
-
-    for left in range(len(evidence)):
-        for right in range(left + 1, len(evidence)):
-            if (
-                _candidate_similarity(evidence[left].text, evidence[right].text)
-                >= _FUZZY_CONSENSUS_THRESHOLD
-            ):
-                union(left, right)
-    grouped: dict[int, list[Evidence]] = {}
-    for index, item in enumerate(evidence):
-        grouped.setdefault(root(index), []).append(item)
-
-    candidates: list[ReviewCandidate] = []
-    for evidence_group in grouped.values():
-        representative = max(
-            evidence_group,
-            key=lambda item: (
-                sum(_candidate_similarity(item.text, other.text) for other in evidence_group),
-                _candidate_quality(item.text),
-                len(_normalize_candidate_text(item.text)),
-                -window.evidence.index(item),
-            ),
-        )
-        sources = tuple(dict.fromkeys(item.source for item in evidence_group))
-        candidates.append(
-            ReviewCandidate(
-                text=representative.text.strip(),
-                evidence_ids=tuple(item.id for item in evidence_group),
-                sources=sources,
-                families=tuple(dict.fromkeys(_source_family(source) for source in sources)),
-            )
-        )
-    return candidates
-
-
-def _candidate_payload(
-    window: ReviewWindow,
-    text_priority_source: str,
+def compare_window(
+    window: AudioWindow,
+    baseline: list[Sentence],
+    evidence: list[dict[str, Any]],
+    primary_source: str,
+    language: SourceLanguage,
 ) -> dict[str, Any]:
-    return {
-        "window_id": window.id,
-        "approximate_time": [round(window.start, 3), round(window.end, 3)],
-        "candidates": [
-            {
-                "candidate": index,
-                "text": candidate.text,
-                "sources": list(candidate.sources),
-                "families": list(candidate.families),
-                "text_priority": text_priority_source in candidate.sources,
-                "quality_warning": _candidate_warning(candidate.text),
-            }
-            for index, candidate in enumerate(_window_candidates(window), start=1)
-        ],
-    }
-
-
-def _fallback_candidate_index(window: ReviewWindow, text_priority_source: str) -> int:
-    candidates = _window_candidates(window)
-    primary_source = window.evidence[0].source if window.evidence else ""
-    ranked = sorted(
-        enumerate(candidates, start=1),
-        key=lambda item: (
-            len(item[1].families),
-            _candidate_quality(item[1].text),
-            text_priority_source in item[1].sources,
-            primary_source in item[1].sources,
-            -item[0],
-        ),
-        reverse=True,
-    )
-    return ranked[0][0] if ranked else 0
-
-
-def _decision_for_candidate(
-    window: ReviewWindow,
-    selected_candidate: int,
-    *,
-    confidence: float,
-    decision: str,
-    reason: str,
-) -> ReviewDecision:
-    candidates = _window_candidates(window)
-    if selected_candidate == 0:
-        return ReviewDecision("", (), confidence, decision, reason, 0)
-    candidate = candidates[selected_candidate - 1]
-    return ReviewDecision(
-        candidate.text,
-        candidate.evidence_ids,
-        confidence,
-        decision,
-        reason,
-        selected_candidate,
-    )
-
-
-def _deterministic_decision(
-    window: ReviewWindow,
-    text_priority_source: str,
-) -> ReviewDecision | None:
-    candidates = _window_candidates(window)
-    if not candidates:
-        return ReviewDecision("", (), 1.0, "non_speech", "没有非空识别候选", 0)
-    if len(candidates) == 1:
-        if _candidate_quality(candidates[0].text) < -1.0:
-            return None
-        families = len(candidates[0].families)
-        return _decision_for_candidate(
-            window,
-            1,
-            confidence=0.96 if families >= 2 else 0.72,
-            decision="consensus" if families >= 2 else "single_family",
-            reason=(
-                f"{families} 个独立模型家族文字一致"
-                if families >= 2
-                else "只有一个模型家族提供有效候选"
-            ),
-        )
-    votes = [
-        len(candidate.families) if _candidate_quality(candidate.text) >= -1.0 else 0
-        for candidate in candidates
+    owned = _window_rows(baseline, window)
+    outside = [
+        row
+        for row in baseline
+        if row not in owned
+        and row.end_seconds > window.audio_start
+        and row.start_seconds < window.audio_end
     ]
-    best_votes = max(votes)
-    winners = [
-        index for index, votes_count in enumerate(votes, start=1) if votes_count == best_votes
-    ]
-    if best_votes >= 2 and len(winners) == 1:
-        return _decision_for_candidate(
-            window,
-            winners[0],
-            confidence=min(0.99, 0.75 + best_votes * 0.08),
-            decision="consensus",
-            reason=f"{best_votes} 个独立模型家族文字一致",
-        )
-    return None
-
-
-def _extract_object(content: str) -> dict[str, Any]:
-    value = content.strip()
-    if value.startswith("```"):
-        value = re.sub(r"^```(?:json)?\s*", "", value, flags=re.IGNORECASE)
-        value = re.sub(r"\s*```$", "", value)
-    try:
-        payload = json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise AsmrDubberError(f"ASR（语音识别）校对模型返回的不是有效 JSON：{exc}") from exc
-    if not isinstance(payload, dict):
-        raise AsmrDubberError("ASR（语音识别）校对 JSON 顶层必须是对象。")
-    return payload
-
-
-def _request_json(
-    settings: ProjectSettings,
-    messages: list[dict[str, str]],
-    job_id: str,
-) -> str:
-    provider = settings.translation_provider
-    if provider not in _LLM_PROVIDERS:
-        raise AsmrDubberError(
-            "多 ASR（语音识别）校对需要大模型；当前翻译供应商不是 LLM。"
-            "请改用 DeepSeek、百炼、豆包、商汤、OpenAI、Claude、Gemini 或本地兼容接口。"
-        )
-    key = resolve_api_key(provider)
-    preset = PROVIDER_PRESETS[provider]
-    base_url = (settings.translation_base_url or str(preset["base_url"])).rstrip("/")
-    if provider == "deepseek":
-        if not key:
-            raise AsmrDubberError("多 ASR（语音识别）校对缺少 DeepSeek API Key。")
-        with httpx.Client(timeout=settings.asr_timeout_seconds) as client:
-            response = client.post(
-                f"{base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "model": settings.translation_model,
-                    "messages": messages,
-                    "response_format": {"type": "json_object"},
-                    "max_tokens": min(65_536, settings.translation_max_output_tokens),
-                    "thinking": {"type": "disabled"},
-                    "temperature": 0.0,
-                    "top_p": 1.0,
-                    "stream": False,
-                    "user_id": job_id,
-                },
-            )
-            if response.status_code >= 400:
-                raise AsmrDubberError(
-                    "DeepSeek ASR（语音识别）校对失败"
-                    f"（HTTP {response.status_code}）：{response.text[:800]}"
-                )
-            data = response.json()
-            return str(data["choices"][0]["message"]["content"])
-
-    adapter = LLMTranslator(
-        provider=provider,
-        api_key=key,
-        model=settings.translation_model,
-        base_url=base_url,
-        system_prompt=f"{settings.asr_review_prompt.strip()}\n\n{_SELECTION_CONTRACT}",
-        temperature=0.0,
-        top_p=1.0,
-        max_output_tokens=settings.translation_max_output_tokens,
-        timeout_seconds=settings.asr_timeout_seconds,
-        extra_body=settings.translation_extra_body,
+    safe = not outside and all(
+        window.start <= row.start_seconds < row.end_seconds <= window.end for row in owned
     )
-    try:
-        content, limited = adapter._request(messages, job_id)
-    finally:
-        adapter.close()
-    if limited:
-        raise AsmrDubberError("ASR（语音识别）校对模型输出达到长度上限。")
-    return content
-
-
-def _validate_results(
-    payload: Mapping[str, Any],
-    targets: list[ReviewWindow],
-    text_priority_source: str,
-) -> dict[str, ReviewDecision]:
-    results = payload.get("results")
-    if not isinstance(results, list):
-        raise AsmrDubberError("ASR（语音识别）校对 JSON 缺少 results 数组。")
-    expected = [window.id for window in targets]
-    actual = [str(item.get("window_id", "")) for item in results if isinstance(item, Mapping)]
-    if actual != expected:
-        raise AsmrDubberError("ASR（语音识别）校对返回的 window_id 数量或顺序不一致。")
-    validated: dict[str, ReviewDecision] = {}
-    for window, item in zip(targets, results, strict=True):
-        assert isinstance(item, Mapping)
-        try:
-            selected_candidate = int(item.get("selected_candidate", -1))
-        except (TypeError, ValueError) as exc:
-            raise AsmrDubberError(f"{window.id} 的候选序号无效。") from exc
-        if not 0 <= selected_candidate <= len(_window_candidates(window)):
-            raise AsmrDubberError(f"{window.id} 选择了不存在的候选序号。")
-        try:
-            confidence = float(item.get("confidence", 0.5))
-        except (TypeError, ValueError):
-            confidence = 0.5
-        confidence = min(1.0, max(0.0, confidence))
-        if confidence < _MIN_LLM_CONFIDENCE:
-            fallback = _fallback_candidate_index(window, text_priority_source)
-            validated[window.id] = _decision_for_candidate(
-                window,
-                fallback,
-                confidence=confidence,
-                decision="low_confidence_fallback",
-                reason=(
-                    f"大模型置信度 {confidence:.2f} 低于 {_MIN_LLM_CONFIDENCE:.2f}，"
-                    "已回退到程序评分最高的现有候选"
-                ),
-            )
+    groups: dict[str, dict[str, Any]] = {}
+    for item in evidence:
+        normalized = normalize_text(item["text"])
+        if not normalized:
+            continue
+        if normalized not in groups:
+            groups[normalized] = dict(item)
         else:
-            validated[window.id] = _decision_for_candidate(
-                window,
-                selected_candidate,
-                confidence=confidence,
-                decision="llm_choice",
-                reason="大模型从现有候选中选择",
+            group = groups[normalized]
+            group["sources"] = list(dict.fromkeys([*group["sources"], *item["sources"]]))
+            group["families"] = list(dict.fromkeys([*group["families"], *item["families"]]))
+            if primary_source in item["sources"]:
+                group["text"], group["sentences"] = item["text"], item["sentences"]
+                group["timing_warning"] = item.get("timing_warning", False)
+    baseline_text = _text(owned, language)
+    candidates = list(groups.values())
+    for candidate in candidates:
+        candidate["protected_change"] = sensitive_change(baseline_text, candidate["text"])
+        candidate["applicable"] = (
+            safe
+            and not candidate.get("timing_warning", False)
+            and bool(candidate["sentences"])
+            and all(
+                window.start - 0.05
+                <= row["start_seconds"]
+                < row["end_seconds"]
+                <= window.end + 0.05
+                for row in candidate["sentences"]
             )
-    return validated
-
-
-def _review_chunk(
-    windows: list[ReviewWindow],
-    targets: list[ReviewWindow],
-    settings: ProjectSettings,
-    job_id: str,
-    source_language: SourceLanguage,
-) -> dict[str, ReviewDecision]:
-    target_ids = [window.id for window in targets]
-    messages = [
-        {
-            "role": "system",
-            "content": f"{settings.asr_review_prompt.strip()}\n\n{_SELECTION_CONTRACT}",
-        },
-        {
-            "role": "user",
-            "content": f"当前音频的源语言是：{source_language_label(source_language)}。",
-        },
-        {
-            "role": "user",
-            "content": (
-                "作品、人物、场景及专有词背景（可能为空，只作为消歧信息，不是台词证据）：\n"
-                + (settings.asr_review_background or "未提供")
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "以下包含目标窗口和少量相邻上下文。只输出 target_window_ids 中的项目：\n"
-                f"文字优先来源：{settings.asr_review_text_priority_model or '未指定'}\n"
-                f"时间戳优先来源：{settings.asr_review_timestamp_priority_model or '未指定'}\n"
-                + json.dumps(
-                    {
-                        "target_window_ids": target_ids,
-                        "windows": [
-                            _candidate_payload(window, settings.asr_review_text_priority_model)
-                            for window in windows
-                        ],
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            ),
-        },
-    ]
-    content = _request_json(settings, messages, job_id)
-    return _validate_results(
-        _extract_object(content),
-        targets,
-        settings.asr_review_text_priority_model,
-    )
-
-
-def _evidence_range(
-    window: ReviewWindow,
-    selected_ids: list[str],
-    timestamp_priority_source: str = "",
-) -> tuple[float, float]:
-    preferred = [item for item in window.evidence if item.source == timestamp_priority_source]
-    if selected_ids and preferred:
-        return (
-            min(item.start for item in preferred),
-            max(item.end for item in preferred),
+            and not any(row.review_locked for row in owned)
         )
-    return window.start, window.end
+    agreement = len(groups) == 1 and len(candidates[0]["families"]) >= 2 if candidates else False
+    changed = any(normalize_text(c["text"]) != normalize_text(baseline_text) for c in candidates)
+    status = (
+        "agreement" if agreement and not changed else "disagreement" if changed else "single_family"
+    )
+    if not candidates:
+        status = "unavailable"
+    if not safe:
+        status = "boundary_review"
+    return {
+        **asdict(window),
+        "status": status,
+        "baseline_text": baseline_text,
+        "baseline_ids": [row.id for row in owned],
+        "baseline_fingerprint": rows_fingerprint(owned),
+        "candidates": candidates,
+        "confidence": None,
+        "action": "keep_baseline",
+        "needs_review": status != "agreement",
+        "boundary_safe": safe,
+        "reason": "上下文或原稿句子跨越片段边界，请试听后在表格校对"
+        if not safe
+        else "主稿保留；一致性是证据，不是经过校准的正确率",
+    }
 
 
-def review_transcriptions(
-    transcriptions: list[tuple[str, list[Sentence]]],
+def recognize_windows(
+    jobs: list[tuple[str, Path]],
+    settings: ProjectSettings,
+    source_language: SourceLanguage,
+    cancel_event: CancellationSignal | None,
+    progress: Progress | None = None,
+) -> Iterator[tuple[str, list[Sentence] | None, str | None]]:
+    from .asr import _transcribe_parakeet, recognition_session, transcribe_source
+
+    if source_language == "zh":
+        raise ProjectError("音频复核只支持日语或英语源音频。")
+
+    if settings.asr_backend == "parakeet_nemo" and jobs:
+        results: dict[str, list[Sentence]] = {}
+        errors: dict[str, str] = {}
+        try:
+            _transcribe_parakeet(
+                jobs[0][1],
+                settings,
+                progress,
+                cancel_event,
+                window_inputs=[path for _, path in jobs],
+                window_results=results,
+                window_errors=errors,
+            )
+            for identifier, path in jobs:
+                yield (
+                    identifier,
+                    None if path.stem in errors else results.get(path.stem, []),
+                    errors.get(path.stem),
+                )
+        except OperationCancelledError:
+            raise
+        except Exception as exc:
+            for identifier, path in jobs:
+                yield identifier, results.get(path.stem), errors.get(path.stem, str(exc))
+        return
+    with recognition_session():
+        consecutive_failures = 0
+        for identifier, path in jobs:
+            check_cancelled(cancel_event)
+            if consecutive_failures >= 3:
+                yield identifier, None, "该后端连续失败，已暂停；保留主稿，可重试复核"
+                continue
+            try:
+                with model_heartbeat(
+                    progress, f"{settings.asr_backend}：准备模型/解码 {identifier}"
+                ) as live_progress:
+                    rows, _ = transcribe_source(
+                        path,
+                        settings,
+                        source_language=source_language,
+                        progress=live_progress,
+                        cancel_event=cancel_event,
+                    )
+                consecutive_failures = 0
+                yield identifier, rows, None
+            except OperationCancelledError:
+                raise
+            except Exception as exc:
+                consecutive_failures += 1
+                yield identifier, None, str(exc)
+
+
+def run_audio_review(
+    audio: Path,
+    baseline: list[Sentence],
     settings: ProjectSettings,
     report_path: Path,
-    analysis_audio: Path | None = None,
-    progress: Progress | None = None,
-    cancel_event: CancellationSignal | None = None,
     *,
     source_language: SourceLanguage = "ja",
+    progress: Progress | None = None,
+    cancel_event: CancellationSignal | None = None,
+    runner: WindowRunner | None = None,
 ) -> list[Sentence]:
-    """Resolve several timed ASR hypotheses while keeping timestamps evidence-bound."""
     check_cancelled(cancel_event)
-    windows = _build_windows(list(transcriptions), settings.asr_review_max_drift_seconds)
-    if not windows:
-        raise AsmrDubberError("多 ASR（语音识别）校对没有可比较的候选窗口。")
-    reviewed: dict[str, ReviewDecision] = {}
-    ambiguous: list[ReviewWindow] = []
-    position_by_id = {window.id: index for index, window in enumerate(windows)}
-    for window in windows:
-        decision = _deterministic_decision(window, settings.asr_review_text_priority_model)
-        if decision is None:
-            ambiguous.append(window)
-        else:
-            reviewed[window.id] = decision
-
-    chunk_size = 8
-    total = math.ceil(len(ambiguous) / chunk_size) if ambiguous else 0
-    for chunk_index, start in enumerate(range(0, len(ambiguous), chunk_size), start=1):
-        check_cancelled(cancel_event)
-        targets = ambiguous[start : start + chunk_size]
-        target_positions = [position_by_id[window.id] for window in targets]
-        context = windows[
-            max(0, min(target_positions) - 2) : min(len(windows), max(target_positions) + 3)
-        ]
-        if progress:
-            progress(f"大模型复核争议句：{chunk_index}/{total}", chunk_index - 1, total)
-        try:
-            reviewed.update(
-                _review_chunk(
-                    context,
-                    targets,
-                    settings,
-                    f"asr-review-{chunk_index}-{int(time.time())}",
-                    source_language,
-                )
-            )
-        except (AsmrDubberError, httpx.HTTPError, KeyError, IndexError, ValueError) as batch_error:
-            check_cancelled(cancel_event)
-            for window in targets:
-                position = position_by_id[window.id]
-                try:
-                    reviewed.update(
-                        _review_chunk(
-                            windows[max(0, position - 2) : position + 3],
-                            [window],
-                            settings,
-                            f"asr-review-{window.id}-{int(time.time())}",
-                            source_language,
-                        )
-                    )
-                except (AsmrDubberError, httpx.HTTPError, KeyError, IndexError, ValueError) as exc:
-                    check_cancelled(cancel_event)
-                    selected = _fallback_candidate_index(
-                        window, settings.asr_review_text_priority_model
-                    )
-                    reviewed[window.id] = _decision_for_candidate(
-                        window,
-                        selected,
-                        confidence=0.35,
-                        decision="fallback",
-                        reason=f"大模型复核失败，已回退主模型：{exc or batch_error}",
-                    )
-        check_cancelled(cancel_event)
-
-    sentences: list[Sentence] = []
-    sentence_by_window: dict[str, Sentence] = {}
-    report_results: list[dict[str, Any]] = []
-    for window in windows:
-        decision = reviewed[window.id]
-        text = decision.text
-        selected_ids = list(decision.evidence_ids)
-        confidence = decision.confidence
-        start, end = _evidence_range(
-            window,
-            selected_ids,
-            settings.asr_review_timestamp_priority_model,
-        )
-        if text and end > start:
-            needs_review = decision.decision in {
-                "single_family",
-                "fallback",
-                "low_confidence_fallback",
-            }
-            sentence = Sentence(
-                id=f"s{len(sentences) + 1:06d}",
-                start_seconds=max(0.0, start),
-                end_seconds=end,
-                source_text=text,
-                status="review_uncertain" if needs_review else "pending",
-                error=(
-                    f"多模型校对未形成可靠共识：{decision.reason}。请试听并核对原文。"
-                    if needs_review
-                    else None
-                ),
-            )
-            sentences.append(sentence)
-            sentence_by_window[window.id] = sentence
-        report_results.append(
-            {
-                "window_id": window.id,
-                "source": text,
-                "evidence_ids": selected_ids,
-                "confidence": confidence,
-                "decision": decision.decision,
-                "reason": decision.reason,
-                "selected_candidate": decision.selected_candidate,
-                "needs_review": decision.decision
-                in {"single_family", "fallback", "low_confidence_fallback"},
-                "computed_time": [start, end],
-                "text_priority_model": settings.asr_review_text_priority_model,
-                "timestamp_priority_model": settings.asr_review_timestamp_priority_model,
-                "candidates": _window_payload(
-                    window,
-                    settings.asr_review_text_priority_model,
-                    settings.asr_review_timestamp_priority_model,
-                )["candidates"],
-            }
-        )
-    if not sentences:
-        raise AsmrDubberError(
-            f"多 ASR（语音识别）校对没有保留任何可信{source_language_label(source_language)}句子。"
-        )
-    sentences.sort(key=lambda item: (item.start_seconds, item.end_seconds))
-    for index, sentence in enumerate(sentences, start=1):
-        sentence.id = f"s{index:06d}"
-    alignment_report: list[dict[str, Any]] = []
-    if settings.asr_review_timestamp_priority_model.startswith("qwen_forced_aligner|"):
-        if analysis_audio is None:
-            raise AsmrDubberError("Qwen3 ForcedAligner 需要 ASR（语音识别）分析音频。")
-        cancel_kwargs = {"cancel_event": cancel_event} if cancel_event is not None else {}
-        alignment_report = align_sentences_with_qwen(
-            analysis_audio,
-            sentences,
-            settings,
-            progress=progress,
-            source_language=source_language,
-            **cancel_kwargs,
-        )
-    for item in report_results:
-        sentence = sentence_by_window.get(str(item["window_id"]))
-        if sentence is not None:
-            item["sentence_id"] = sentence.id
-            item["computed_time"] = [sentence.start_seconds, sentence.end_seconds]
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(
-        json.dumps(
-            {"results": report_results, "timestamp_alignment": alignment_report},
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    runner = runner or recognize_windows
+    primary = f"{settings.asr_backend}|{settings.asr_model}"
+    sources = list(dict.fromkeys([primary, *settings.asr_review_models]))
+    windows = plan_windows(
+        audio, settings.asr_review_window_seconds, settings.asr_review_context_seconds
     )
+    windows = merge_boundary_windows(windows, baseline, settings.asr_review_context_seconds)
+    source_hash = cached_sha256_file(audio)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    run_id = uuid.uuid4().hex
+    cache_dir = report_path.parent / "review-v2-cache"
+    cache_dir.mkdir(exist_ok=True)
+    clips_dir = (
+        report_path.parent
+        / "review-audio"
+        / _digest([source_hash, [asdict(w) for w in windows]])[:24]
+    )
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    evidence: dict[str, list[dict[str, Any]]] = {window.id: [] for window in windows}
+    warnings: list[dict[str, str]] = []
+    by_id = {window.id: window for window in windows}
+    report: dict[str, Any] = {
+        "schema": REVIEW_VERSION,
+        "run_id": run_id,
+        "state": "running",
+        "audio_sha256": source_hash,
+        "baseline_fingerprint": rows_fingerprint(baseline),
+        "baseline": [row.model_dump() for row in baseline],
+        "primary_source": primary,
+        "mode": settings.asr_review_mode,
+        "results": [],
+        "warnings": warnings,
+        "undo": [],
+    }
+    if report_path.is_file():
+        import shutil
+
+        history = report_path.parent / "review-history"
+        history.mkdir(exist_ok=True)
+        shutil.copyfile(report_path, history / f"{uuid.uuid4().hex}.json")
+
+    def checkpoint(state: str = "running") -> None:
+        report["state"] = state
+        report["results"] = [
+            compare_window(w, baseline, evidence[w.id], primary, source_language) for w in windows
+        ]
+        _write(report_path, report)
+
+    checkpoint()
+    try:
+        with sf.SoundFile(audio) as source_audio:
+            required_bytes = sum(
+                round((w.audio_end - w.audio_start) * source_audio.samplerate)
+                * source_audio.channels
+                * 2
+                for w in windows
+                if not (clips_dir / f"{w.id}.wav").is_file()
+            )
+            require_disk_space(clips_dir, required_bytes)
+            for window in windows:
+                check_cancelled(cancel_event)
+                clip = clips_dir / f"{window.id}.wav"
+                expected_frames = round(
+                    (window.audio_end - window.audio_start) * source_audio.samplerate
+                )
+                if clip.is_file():
+                    try:
+                        if sf.info(clip).frames == expected_frames:
+                            continue
+                    except (OSError, RuntimeError):
+                        pass
+                source_audio.seek(round(window.audio_start * source_audio.samplerate))
+                samples = source_audio.read(
+                    round((window.audio_end - window.audio_start) * source_audio.samplerate),
+                    dtype="float32",
+                )
+                sf.write(
+                    clip,
+                    samples,
+                    source_audio.samplerate,
+                    subtype="PCM_16",
+                )
+        for source_index, label in enumerate(sources):
+            check_cancelled(cancel_event)
+            backend, separator, model = label.partition("|")
+            if not separator:
+                warnings.append({"source": label, "error": "复核模型配置无效"})
+                continue
+            payload = settings.model_dump()
+            payload.update(
+                asr_backend=backend,
+                asr_model=model,
+                asr_review_enabled=False,
+                asr_vad_mode="off",
+                asr_vad_filter=False,
+                skip_japanese_fillers=False,
+            )
+            try:
+                configured = ProjectSettings.model_validate(payload)
+            except ValueError as exc:
+                warnings.append({"source": label, "error": str(exc)})
+                continue
+            acoustic_settings = {
+                k: v
+                for k, v in configured.model_dump().items()
+                if (k.startswith("asr_") and not k.startswith("asr_review"))
+                or k in {"pause_split_seconds", "max_sentence_seconds"}
+            }
+            pending = []
+            paths = {}
+            for window in windows:
+                key = _digest(
+                    [
+                        REVIEW_VERSION,
+                        source_hash,
+                        asdict(window),
+                        label,
+                        source_language,
+                        acoustic_settings,
+                    ]
+                )
+                path = cache_dir / f"{key}.json"
+                paths[window.id] = path
+                try:
+                    cached = json.loads(path.read_text(encoding="utf-8"))
+                    rows = [Sentence.model_validate(row) for row in cached["sentences"]]
+                    evidence[window.id].append(_candidate(rows, window, label, source_language))
+                except (OSError, ValueError, KeyError, TypeError):
+                    pending.append((window.id, clips_dir / f"{window.id}.wav"))
+            if progress:
+                progress(
+                    f"统一音频复核 {source_index + 1}/{len(sources)}：{label}"
+                    f"，待处理 {len(pending)} 段",
+                    source_index,
+                    len(sources),
+                )
+            processed = [len(windows) - len(pending), 0]
+            pending_count = len(pending)
+
+            def window_progress(
+                message: str,
+                current: int,
+                total: int,
+                _label=label,
+                _backend=backend,
+                _source_index=source_index,
+                _processed=processed,
+                _pending_count=pending_count,
+            ) -> None:
+                if progress:
+                    partial = max(0.0, min(1.0, current / max(1, total)))
+                    if _backend == "parakeet_nemo":
+                        partial *= _pending_count
+                    completed = min(len(windows), _processed[0] + partial)
+                    _processed[1] = max(
+                        _processed[1],
+                        round((_source_index + completed / max(1, len(windows))) * 10000),
+                    )
+                    progress(
+                        f"{_label} · 已完成 {_processed[0]}/{len(windows)} 段 · {message}",
+                        _processed[1],
+                        len(sources) * 10000,
+                    )
+
+            try:
+                for identifier, rows, error in runner(
+                    pending, configured, source_language, cancel_event, window_progress
+                ):
+                    check_cancelled(cancel_event)
+                    if rows is None:
+                        warnings.append(
+                            {"source": label, "window": identifier, "error": error or "复核失败"}
+                        )
+                    else:
+                        try:
+                            item = _candidate(rows, by_id[identifier], label, source_language)
+                            evidence[identifier].append(item)
+                            _write(
+                                paths[identifier], {"sentences": [row.model_dump() for row in rows]}
+                            )
+                        except (ValueError, KeyError) as exc:
+                            warnings.append(
+                                {"source": label, "window": identifier, "error": str(exc)}
+                            )
+                    processed[0] += 1
+                    window_progress("片段结果已保存", 0, 1)
+                checkpoint()
+            except OperationCancelledError:
+                raise
+            except Exception as exc:
+                warnings.append({"source": label, "error": str(exc)})
+                checkpoint()
+        checkpoint("completed_with_warnings" if warnings else "completed")
+    except OperationCancelledError:
+        checkpoint("cancelled")
+        raise
+    except Exception as exc:
+        warnings.append({"source": "review", "error": str(exc)})
+        checkpoint("failed")
+    output = [row.model_copy(deep=True) for row in baseline]
+    if settings.asr_review_mode == "conservative" and report["state"].startswith("completed"):
+        for result in report["results"]:
+            viable = [
+                candidate
+                for candidate in result["candidates"]
+                if candidate["applicable"]
+                and not candidate["protected_change"]
+                and automatic_edit_allowed(result["baseline_text"], candidate["text"])
+                and all(row.enabled for row in output if row.id in result["baseline_ids"])
+                and len(candidate["families"]) >= 2
+                and primary in candidate["sources"]
+                and normalize_text(candidate["text"]) != normalize_text(result["baseline_text"])
+            ]
+            if len(viable) == 1 and result["baseline_ids"]:
+                before = [row.model_dump() for row in output if row.id in result["baseline_ids"]]
+                output = replace_window(output, result, viable[0], settings, source_language)
+                after = [
+                    row for row in output if row.id.startswith(f"{result['id']}-{viable[0]['id']}-")
+                ]
+                report["undo"].append(
+                    {
+                        "window": result["id"],
+                        "before": before,
+                        "after_ids": [row.id for row in after],
+                        "after_fingerprint": rows_fingerprint(after),
+                    }
+                )
+                result["action"] = "auto_applied"
+                result["selected_candidate"] = viable[0]["id"]
+    _write(report_path, report)
     if progress:
+        count = sum(item["needs_review"] for item in report["results"])
         progress(
-            f"多 ASR（语音识别）校对完成：保留 {len(sentences)} 句，"
-            f"其中 {len(ambiguous)} 句需要大模型复核",
-            total,
-            total,
+            f"音频复核完成：{len(windows)} 段，{count} 段待查看；主稿已保留",
+            len(sources),
+            len(sources),
         )
-    return sentences
+    return output
+
+
+def replace_window(
+    current: list[Sentence],
+    result: dict[str, Any],
+    candidate: dict[str, Any],
+    settings: ProjectSettings,
+    source_language: SourceLanguage = "ja",
+) -> list[Sentence]:
+    from .segmentation import TimedToken, split_timed_tokens
+
+    owned = [row for row in current if row.id in result["baseline_ids"]]
+    intersecting = [
+        row
+        for row in current
+        if row.end_seconds > result["start"] and row.start_seconds < result["end"]
+    ]
+    if {row.id for row in intersecting} != set(result["baseline_ids"]):
+        raise ProjectError("片段内句子已新增、删除或移动，旧提案不能覆盖当前内容。")
+    if rows_fingerprint(owned) != result["baseline_fingerprint"] or any(
+        row.review_locked for row in owned
+    ):
+        raise ProjectError("该片段的主稿已修改或已人工锁定，请重新复核；未覆盖校对内容。")
+    if not candidate["applicable"]:
+        raise ProjectError("该候选跨越上下文边界，不能安全一键应用；请试听后在表格校对。")
+    rows = [Sentence.model_validate(row) for row in candidate["sentences"]]
+    if not rows or any(
+        not result["start"] - 0.05 <= row.start_seconds < row.end_seconds <= result["end"] + 0.05
+        for row in rows
+    ):
+        raise ProjectError("候选时间范围无效。")
+    normalized = split_timed_tokens(
+        [
+            TimedToken(
+                (" " if source_language == "en" else "") + row.source_text,
+                row.start_seconds,
+                row.end_seconds,
+            )
+            for row in rows
+        ],
+        pause_seconds=settings.pause_split_seconds,
+        max_sentence_seconds=settings.max_sentence_seconds,
+    )
+    for index, row in enumerate(normalized):
+        row.id = f"{result['id']}-{candidate['id']}-{index + 1}"
+        row.review_locked = True
+        row.status = "review_accepted"
+    kept = [row for row in current if row.id not in result["baseline_ids"]]
+    return sorted(
+        [*kept, *normalized], key=lambda row: (row.start_seconds, row.end_seconds, row.id)
+    )

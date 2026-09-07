@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import shutil
 import subprocess
 import threading
@@ -17,7 +18,9 @@ import soxr
 from .constants import MAX_CHINESE_AUTO_SPEED
 from .environment import ffmpeg_executable
 from .errors import AsmrDubberError, OperationCancelledError, ProjectError
+from .filtering import has_speakable_text
 from .models import AudioInfo, Sentence
+from .storage import require_disk_space
 from .task_control import (
     check_cancelled,
     register_process,
@@ -176,6 +179,7 @@ def copy_source_verbatim(
             raise ProjectError(f"项目中已存在不同的源文件：{destination}")
     else:
         temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        require_disk_space(destination.parent, original.stat().st_size)
         digest = hashlib.sha256()
         copied = 0
         total = original.stat().st_size
@@ -236,6 +240,7 @@ def _run_ffmpeg(arguments: list[str], *, cwd: Path | None = None) -> None:
     command = [ffmpeg_executable(), "-hide_banner", "-loglevel", "error", *arguments]
     process = subprocess.Popen(
         command,
+        start_new_session=os.name != "nt",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -354,7 +359,11 @@ def sentence_events(
     durations: dict[str, float] = {}
     sentence_by_id: dict[str, Sentence] = {}
     for sentence in sentences:
-        if not sentence.enabled or not sentence.zh_text or not sentence.tts_file:
+        if (
+            not sentence.enabled
+            or not has_speakable_text(sentence.zh_text)
+            or not sentence.tts_file
+        ):
             continue
         audio_path = resolve_project_path(
             project_dir,
@@ -562,6 +571,7 @@ def build_chinese_stem(
         prepared.append((event, start_frame))
         total_frames = max(total_frames, start_frame + resampled_frames)
 
+    require_disk_space(destination.parent, total_frames * channels * 8)
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp.wav")
     source_reference: sf.SoundFile | None = None
     try:

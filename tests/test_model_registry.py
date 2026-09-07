@@ -26,6 +26,7 @@ def test_only_supported_asr_and_tts_backends_are_registered() -> None:
     assert "large-v2" in ASR_BACKENDS["faster_whisper"].models
     assert "kotoba-tech/kotoba-whisper-v2.0-faster" in (ASR_BACKENDS["faster_whisper"].models)
     assert set(TTS_BACKENDS) == {
+        "indextts2_5",
         "indextts2",
         "indextts2_api",
         "generic_tts_api",
@@ -37,6 +38,9 @@ def test_only_supported_asr_and_tts_backends_are_registered() -> None:
         "minimax",
     }
     assert TTS_BACKENDS["indextts2"].reference_text == "unused"
+    assert TTS_BACKENDS["indextts2_5"].reference_text == "unused"
+    assert TTS_BACKENDS["indextts2_5"].installer == "isolated"
+    assert TTS_BACKENDS["indextts2_5"].tested_default is False
     assert TTS_BACKENDS["gpt_sovits"].reference_text == "required"
     assert TTS_BACKENDS["fish_speech"].api_key is True
     assert TTS_BACKENDS["edge_tts"].api_key is False

@@ -4,6 +4,8 @@
 
 ## 使用和配置问题
 
+先从[文档索引](docs/INDEX.md)选择流程。请区分正式包与开发版，并说明是否有未提交改动。保存问题注明保存范围、成功提示、浏览器刷新还是程序重启、是否重开项目；卡顿注明句数、音频时长、已选模型和具体阶段。
+
 安装方法、硬件选择、模型配置和一般使用问题，请到
 [GitHub Discussions 的 Q&A 分类](https://github.com/EveningStudy/asmr-dubber/discussions/categories/q-a)
 提问。提问前建议先查阅 [README](README.md)、[用户指南](docs/USER_GUIDE.md)和

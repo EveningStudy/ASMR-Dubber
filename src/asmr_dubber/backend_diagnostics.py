@@ -133,7 +133,9 @@ def test_tts_api(project_path: str, settings: UserSettings, api_key: str = "") -
         key=lambda item: (item.end_seconds - item.start_seconds, -item.start_seconds),
     )
     sentence.zh_text = "这是一次语音接口测试。"
-    source = (project_dir / project.source.path).resolve()
+    from .audio import verify_source
+
+    source = verify_source(project_dir, project.source)
     if not source.is_file():
         raise ProjectError(f"找不到当前项目的源音频：{source}")
 

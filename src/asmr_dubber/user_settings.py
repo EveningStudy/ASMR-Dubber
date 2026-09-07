@@ -10,7 +10,12 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .audio import probe_audio, sha256_file
-from .constants import INDEXTTS_REQUIRED_DIRS, INDEXTTS_REQUIRED_FILES
+from .constants import (
+    INDEXTTS25_REQUIRED_DIRS,
+    INDEXTTS25_REQUIRED_FILES,
+    INDEXTTS_REQUIRED_DIRS,
+    INDEXTTS_REQUIRED_FILES,
+)
 from .errors import ProjectError
 from .languages import SourceLanguage, SpeechSourceLanguage
 from .models import ProjectSettings
@@ -141,6 +146,8 @@ _PORTABLE_PATH_FIELDS = (
     "tts_config_path",
     "tts_external_reference_audio",
     "tts_index_external_emotion_audio",
+    "tts_index25_model_path",
+    "tts_index25_config_path",
 )
 
 
@@ -224,6 +231,7 @@ class UserSettings(ProjectSettings):
                 value["asr_backend"] = "parakeet_nemo"
                 value["asr_model"] = "grider-transwithai/parakeet-ctc-1.1b-ja::parakeet-ja-gal.nemo"
             if "tts_backend" in value and value.get("tts_backend") not in {
+                "indextts2_5",
                 "indextts2",
                 "indextts2_api",
                 "generic_tts_api",
@@ -342,19 +350,27 @@ def load_user_settings() -> UserSettings:
         settings = UserSettings.model_validate(_read_json(path))
     except ValidationError as exc:
         raise ProjectError(f"本地设置校验失败 {path}: {exc}") from exc
-    if settings.tts_backend == "indextts2":
-        # Keep IndexTTS2 as the preferred local backend when it is usable, but
+    if settings.tts_backend in {"indextts2_5", "indextts2"}:
+        # Keep the selected local IndexTTS backend when it is usable, but
         # do not leave a fresh/core installation pointing at a missing runtime.
         from .model_registry import TTS_BACKENDS
 
-        model_dir = Path(settings.tts_model_path).expanduser().resolve()
+        is_25 = settings.tts_backend == "indextts2_5"
+        model_dir = (
+            Path(settings.tts_index25_model_path if is_25 else settings.tts_model_path)
+            .expanduser()
+            .resolve()
+        )
+        executable_name = "python" if is_25 else "indextts2"
+        required_files = INDEXTTS25_REQUIRED_FILES if is_25 else INDEXTTS_REQUIRED_FILES
+        required_dirs = INDEXTTS25_REQUIRED_DIRS if is_25 else INDEXTTS_REQUIRED_DIRS
         runtime_ready = any(
             candidate.is_file()
-            for candidate in runtime_executable_candidates(model_dir.parent, "indextts2")
+            for candidate in runtime_executable_candidates(model_dir.parent, executable_name)
         )
-        resources_ready = all(
-            (model_dir / name).is_file() for name in INDEXTTS_REQUIRED_FILES
-        ) and all((model_dir / name).is_dir() for name in INDEXTTS_REQUIRED_DIRS)
+        resources_ready = all((model_dir / name).is_file() for name in required_files) and all(
+            (model_dir / name).is_dir() for name in required_dirs
+        )
         if not (runtime_ready and resources_ready):
             edge = TTS_BACKENDS["edge_tts"]
             settings = settings.model_copy(

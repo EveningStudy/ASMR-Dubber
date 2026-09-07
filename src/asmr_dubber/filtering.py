@@ -104,6 +104,18 @@ def is_japanese_filler_only(text: str) -> bool:
     return bool(re.fullmatch(r"(?:うん|あ+|え+|うわ+|お+|ん+){2,}", without_tail))
 
 
+def has_speakable_text(text: str) -> bool:
+    """Return whether a TTS backend has lexical content to pronounce.
+
+    Letters cover Chinese, Japanese, Korean and alphabetic scripts; numbers
+    are also pronounceable. Punctuation, whitespace, emoji and decorative
+    symbols alone must not be sent to any local or remote TTS backend.
+    """
+
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    return any(unicodedata.category(character)[0] in {"L", "N"} for character in normalized)
+
+
 def implausible_asr_reason(text: str, duration_seconds: float) -> str | None:
     """Return a user-facing reason for physically implausible ASR output.
 

@@ -20,6 +20,8 @@ from typing import Any, Literal
 from .constants import (
     ASMR_VAD_MODEL,
     DEFAULT_ALIGNER_MODEL,
+    INDEXTTS25_REQUIRED_DIRS,
+    INDEXTTS25_REQUIRED_FILES,
     INDEXTTS_REQUIRED_DIRS,
     INDEXTTS_REQUIRED_FILES,
     OPTIONAL_ASR_MODEL_REVISIONS,
@@ -460,24 +462,37 @@ def backend_status(
         if missing:
             return BackendStatus("broken", "模型不完整", "缺少 " + "、".join(missing))
         return BackendStatus("ready", "可用", str(executable))
-    if backend.id == "indextts2":
-        configured = str(getattr(settings, "tts_model_path", "") or "").strip()
+    if backend.id in {"indextts2_5", "indextts2"}:
+        is_25 = backend.id == "indextts2_5"
+        configured = str(
+            getattr(
+                settings,
+                "tts_index25_model_path" if is_25 else "tts_model_path",
+                "",
+            )
+            or ""
+        ).strip()
         if not configured:
             return BackendStatus("missing", "未安装")
         model_dir = Path(configured).expanduser().resolve()
         executable = next(
             (
                 path
-                for path in runtime_executable_candidates(model_dir.parent, "indextts2")
+                for path in runtime_executable_candidates(
+                    model_dir.parent,
+                    "python" if is_25 else "indextts2",
+                )
                 if path.is_file()
             ),
             None,
         )
         if executable is None:
             return BackendStatus("missing", "未安装", "缺少独立运行环境")
+        required_files = INDEXTTS25_REQUIRED_FILES if is_25 else INDEXTTS_REQUIRED_FILES
+        required_dirs = INDEXTTS25_REQUIRED_DIRS if is_25 else INDEXTTS_REQUIRED_DIRS
         missing = sorted(
-            [name for name in INDEXTTS_REQUIRED_FILES if not (model_dir / name).is_file()]
-            + [name + "/" for name in INDEXTTS_REQUIRED_DIRS if not (model_dir / name).is_dir()]
+            [name for name in required_files if not (model_dir / name).is_file()]
+            + [name + "/" for name in required_dirs if not (model_dir / name).is_dir()]
         )
         if missing:
             detail = "、".join(missing[:4])
@@ -582,7 +597,7 @@ def backend_model_status(
         return overall
     if overall.state == "external":
         return BackendStatus("external", "需连接外部服务确认")
-    if backend.id == "indextts2":
+    if backend.id in {"indextts2_5", "indextts2"}:
         return overall
 
     repository: str | None = None
@@ -853,6 +868,7 @@ def backend_model_pack_ids(backend_id: str) -> set[str]:
         pack = "parakeet-ja-windows" if current_platform().is_windows else "parakeet-ja-linux"
         return {pack}
     return {
+        "indextts2_5": {"indextts2_5-checkpoints"},
         "indextts2": {"indextts2-checkpoints"},
         "kotoba_whisper": {"kotoba-whisper-v2.2"},
         "faster_whisper": {"faster-whisper-large-v2"},
@@ -901,6 +917,7 @@ def import_backend_model_packs(
 
 
 def _install_indextts_runtime(
+    backend_id: str,
     *,
     timeout_seconds: float,
     env: dict[str, str],
@@ -910,7 +927,10 @@ def _install_indextts_runtime(
     info = current_platform()
     if info.is_windows:
         executable = _powershell_executable()
-        script = PROJECT_ROOT / "scripts" / "windows" / "install-indextts2.ps1"
+        script_name = (
+            "install-indextts25.ps1" if backend_id == "indextts2_5" else "install-indextts2.ps1"
+        )
+        script = PROJECT_ROOT / "scripts" / "windows" / script_name
         if executable is None:
             raise EnvironmentError("找不到 PowerShell；Windows 自带 5.1 或 PowerShell 7 均可。")
         command = [
@@ -924,7 +944,10 @@ def _install_indextts_runtime(
         ]
     else:
         executable = Path(shutil.which("bash") or "")
-        script = PROJECT_ROOT / "scripts" / "linux" / "install-indextts2.sh"
+        script_name = (
+            "install-indextts25.sh" if backend_id == "indextts2_5" else "install-indextts2.sh"
+        )
+        script = PROJECT_ROOT / "scripts" / "linux" / script_name
         if not executable.is_file():
             raise EnvironmentError("找不到 bash，无法安装 IndexTTS2 独立运行时。")
         command = [str(executable), str(script)]
@@ -1102,6 +1125,11 @@ def _install_backend_unlocked(
         raise EnvironmentError(
             "该后端暂不支持应用内自动安装；请按照后端说明启动外部服务或独立运行时。"
         )
+    if not (PROJECT_ROOT / "scripts").is_dir() or not (PROJECT_ROOT / "mirrors.json").is_file():
+        raise EnvironmentError(
+            "当前为 wheel/API 安装，不包含便携安装器资源。"
+            "本地模型自动安装请使用完整源码或便携发行包；现有 CLI/API 功能不受影响。"
+        )
     extra = spec.python_extra
     if spec.installer == "python-extra" and not extra:
         raise EnvironmentError(f"{spec.label} 的安装声明缺少 Python extra。")
@@ -1164,6 +1192,7 @@ def _install_backend_unlocked(
     if progress:
         progress(0, desc=start_message)
     env = os.environ.copy()
+    env["ASMR_DUBBER_INSTALL_LOCK_HELD"] = "1"
     env.setdefault("UV_LINK_MODE", "copy" if os.name == "nt" else "clone")
     if imported_packs:
         env["ASMR_DUBBER_MODEL_PACKS_PREPARED"] = "1"
@@ -1181,6 +1210,7 @@ def _install_backend_unlocked(
             )
         elif spec.installer == "isolated":
             completed = _install_indextts_runtime(
+                backend_id,
                 timeout_seconds=timeout_seconds,
                 env=env,
                 log_callback=log_callback,
@@ -1243,11 +1273,11 @@ def _install_backend_unlocked(
         )
     if spec.installer == "isolated":
         if progress:
-            progress(1, desc="IndexTTS2 独立环境与模型安装完成")
+            progress(1, desc=f"{spec.label} 独立环境与模型安装完成")
         tail = (completed.stdout or completed.stderr).strip().splitlines()[-12:]
-        result = "IndexTTS2 安装完成。\n" + "\n".join(tail) + "\n请重启 ASMR Dubber。"
+        result = f"{spec.label} 安装完成。\n" + "\n".join(tail) + "\n请重启 ASMR Dubber。"
         if log_callback is not None:
-            log_callback("IndexTTS2 独立环境与模型安装完成。")
+            log_callback(f"{spec.label} 独立环境与模型安装完成。")
         return result
     if progress:
         progress(0.5, desc=f"{spec.label} 运行环境安装完成，正在检查模型")

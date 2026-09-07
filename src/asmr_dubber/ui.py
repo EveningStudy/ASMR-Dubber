@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import inspect
 import io
 import ipaddress
@@ -63,6 +64,8 @@ from .constants import (
     DEFAULT_ASR_REVIEW_TEXT_PRIORITY,
     DEFAULT_ASR_REVIEW_TIMESTAMP_PRIORITY,
     DEFAULT_CHINESE_RELATIVE_LOUDNESS_DB,
+    INDEXTTS25_REQUIRED_DIRS,
+    INDEXTTS25_REQUIRED_FILES,
     INDEXTTS_REQUIRED_DIRS,
     INDEXTTS_REQUIRED_FILES,
     MAX_CHINESE_AUTO_SPEED,
@@ -73,6 +76,15 @@ from .model_packs import discover_model_packs, import_discovered_model_packs, mo
 from .model_registry import ASR_BACKENDS, CLONE_MODE_LABELS, TTS_BACKENDS
 from .models import ProjectSettings, load_project, settings_for_source_language
 from .platforms import portable_home, require_supported_platform, runtime_executable_candidates
+from .review_services import (
+    align_review,
+    apply_review,
+    candidate_details,
+    retry_review,
+    review_overview,
+    undo_review,
+    unlock_review,
+)
 from .runtime_manager import (
     asmr_vad_status,
     available_asr_review_choices,
@@ -89,9 +101,10 @@ from .runtime_manager import (
 )
 from .task_control import CancellationToken, cancellation_scope
 from .translation import default_translation_prompt
+from .ui_assets import _NATIVE_OUTPUT_AUDIO_JS as _NATIVE_OUTPUT_AUDIO_JS
+from .ui_assets import APP_CSS as APP_CSS
 from .ui_services import (
     TABLE_HEADERS,
-    TABLE_TYPES,
     ProjectView,
     analyze,
     apply_global_settings,
@@ -129,132 +142,6 @@ from .user_settings import (
     store_reference_audio,
 )
 
-APP_CSS = """
-:root, body, .gradio-container {
-    --font: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
-    font-family: var(--font) !important;
-}
-.gradio-container {
-    width: 100% !important;
-    max-width: 1440px !important;
-    min-width: 0 !important;
-    margin-inline: auto !important;
-}
-:root .gradio-container > .main.fillable {
-    padding-left: clamp(.75rem, 3vw, 2rem) !important;
-    padding-right: clamp(.75rem, 3vw, 2rem) !important;
-}
-.gradio-container main,
-.gradio-container .main,
-.gradio-container .column,
-.gradio-container .row,
-.gradio-container [role="tabpanel"] { min-width: 0 !important; }
-.gradio-container [role="tablist"] {
-    max-width: 100%;
-    overflow-x: auto !important;
-    overflow-y: hidden;
-    scrollbar-width: thin;
-}
-#asmr-dubber-product-marker { margin: .25rem 0 1rem; }
-#asmr-dubber-product-marker h1 { margin: 0; font-size: clamp(1.75rem, 5vw, 2.45rem); }
-#asmr-dubber-product-marker p { margin: .35rem 0 0; color: var(--body-text-color-subdued); }
-#workflow-hint { border-left: 4px solid var(--color-accent); padding-left: .85rem; }
-#workflow-hint #workflow-hint { border-left: 0 !important; padding-left: 0 !important; }
-#project-start {
-    border: 1px solid var(--border-color-primary) !important;
-    border-left: 4px solid var(--color-accent) !important;
-    border-radius: 10px !important;
-    padding: clamp(.75rem, 2vw, 1.15rem) !important;
-}
-#project-start #project-start {
-    border: 0 !important;
-    padding: 0 !important;
-}
-#project-summary {
-    margin: .25rem 0 .75rem !important;
-    padding: .7rem .85rem !important;
-    border-radius: 8px;
-    background: var(--block-background-fill);
-    color: var(--body-text-color-subdued);
-}
-#project-summary p { margin: 0 !important; }
-#project-summary #project-summary {
-    margin: 0 !important;
-    padding: 0 !important;
-    background: transparent !important;
-}
-.workflow-actions button { min-height: 44px; font-weight: 600; }
-#project-status {
-    border-left: 4px solid var(--color-accent) !important;
-    padding: .65rem .85rem !important;
-    background: var(--block-background-fill);
-}
-#project-status p { margin: 0 !important; white-space: pre-wrap; }
-#project-status #project-status { border-left: 0 !important; padding: 0 !important; }
-#autoflow-start {
-    border: 1px solid var(--border-color-primary) !important;
-    border-left: 4px solid var(--color-accent) !important;
-    border-radius: 10px !important;
-    padding: clamp(.75rem, 2vw, 1.15rem) !important;
-}
-#autoflow-start #autoflow-start {
-    border: 0 !important;
-    padding: 0 !important;
-}
-#autoflow-status {
-    border-left: 4px solid var(--color-accent) !important;
-    padding: .65rem .85rem !important;
-}
-#autoflow-options {
-    border: 1px solid var(--border-color-primary) !important;
-    border-radius: 10px !important;
-    padding: clamp(.75rem, 2vw, 1.15rem) !important;
-    margin-top: .75rem !important;
-}
-#autoflow-options #autoflow-options {
-    border: 0 !important;
-    padding: 0 !important;
-    margin: 0 !important;
-}
-#autoflow-options-note,
-#autoflow-settings-note {
-    border-left: 4px solid var(--color-accent) !important;
-    padding: .65rem .85rem !important;
-    background: var(--block-background-fill);
-    border-radius: 6px;
-}
-#autoflow-options-note p,
-#autoflow-settings-note p { margin: 0 !important; }
-#autoflow-options-note #autoflow-options-note,
-#autoflow-settings-note #autoflow-settings-note {
-    border-left: 0 !important;
-    padding: 0 !important;
-    background: transparent !important;
-}
-.autoflow-section-title { margin-top: .35rem !important; }
-.autoflow-table table { min-width: 720px; }
-.status-panel textarea, .diagnostics-panel textarea { font-family: var(--font); }
-.optional-section { opacity: .96; }
-.sentence-table, .backend-table, .profile-table {
-    min-width: 0 !important;
-    max-width: 100% !important;
-    overflow-x: auto !important;
-}
-.sentence-table table { min-width: 760px; }
-.backend-table table { min-width: 900px; }
-.profile-table table { min-width: 640px; }
-.gradio-container code { overflow-wrap: anywhere; }
-button:focus-visible, input:focus-visible, textarea:focus-visible, [role="tab"]:focus-visible {
-    outline: 3px solid var(--color-accent) !important;
-    outline-offset: 2px;
-}
-footer { display: none !important; }
-@media (max-width: 640px) {
-    .mobile-stack { flex-direction: column !important; }
-    .mobile-stack > * { width: 100% !important; min-width: 0 !important; }
-}
-"""
-
 CATALOG_HEADERS = ["后端", "支持级别", "设备兼容性", "状态", "说明", "磁盘占用"]
 PROFILE_MARKDOWN = """
 | 安装档位 | 包含内容 | 安装后约占用 | 建议可用空间 |
@@ -274,40 +161,6 @@ Windows 双击 `ASMR-Dubber-Setup.exe`；Linux 运行
 
 _INSTALLABLE = set(installable_backend_ids())
 _PRIVATE_API: Any = False
-_NATIVE_OUTPUT_AUDIO_JS = """
-() => {
-    const syncOutputAudio = () => {
-        for (const id of ["output-audio-preview", "output-stem-preview"]) {
-            const root = document.getElementById(id);
-            const audio = root?.querySelector("audio");
-            const download = root?.querySelector('a[data-testid="download-link"]');
-            if (audio && download && audio.src !== download.href) {
-                audio.src = download.href;
-                audio.load();
-            }
-        }
-    };
-    globalThis.__asmrDubberAudioObserver?.disconnect();
-    const observer = new MutationObserver(syncOutputAudio);
-    observer.observe(document.body, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ["href"],
-    });
-    globalThis.__asmrDubberAudioObserver = observer;
-    syncOutputAudio();
-
-    clearInterval(globalThis.__asmrDubberAutoflowLogTimer);
-    let previousLog = null;
-    globalThis.__asmrDubberAutoflowLogTimer = setInterval(() => {
-        const textarea = document.querySelector("#autoflow-run-log textarea");
-        if (!textarea || textarea.value === previousLog) return;
-        previousLog = textarea.value;
-        textarea.scrollTop = textarea.scrollHeight;
-    }, 250);
-}
-"""
 _LLM_TRANSLATION_PROVIDERS = frozenset(
     {
         "deepseek",
@@ -734,6 +587,32 @@ def indextts_installation_status(model_path: Any) -> str:
     return f"IndexTTS2 已就绪：{executable}；模型目录：{directory}"
 
 
+def indextts25_installation_status(model_path: Any) -> str:
+    text = str(model_path or "").strip()
+    if not text:
+        return "未填写 IndexTTS-2.5 checkpoints 目录。"
+    directory = Path(text).expanduser().resolve()
+    executable = next(
+        (
+            candidate
+            for candidate in runtime_executable_candidates(directory.parent, "python")
+            if candidate.is_file()
+        ),
+        None,
+    )
+    missing = sorted(
+        [name for name in INDEXTTS25_REQUIRED_FILES if not (directory / name).is_file()]
+        + [name + "/" for name in INDEXTTS25_REQUIRED_DIRS if not (directory / name).is_dir()]
+    )
+    if executable is None:
+        return "运行环境未安装。请在“设备与模型”中安装 IndexTTS-2.5。"
+    if missing:
+        preview = "、".join(missing[:5])
+        suffix = f" 等 {len(missing)} 项" if len(missing) > 5 else ""
+        return f"运行环境已安装，但模型不完整：缺少 {preview}{suffix}。"
+    return f"IndexTTS-2.5 已就绪：{executable}；模型目录：{directory}"
+
+
 def offline_model_pack_markdown() -> str:
     inbox = model_pack_directory()
     inspections = discover_model_packs(inbox)
@@ -769,7 +648,7 @@ def _view_values(view: ProjectView) -> tuple[Any, ...]:
     preview: str | None = None
     if view.manifest and view.rows:
         with suppress(Exception):
-            choices, selected, preview = reference_picker(view.manifest)
+            choices, selected, preview = reference_picker(view.manifest, include_preview=False)
     return (
         view.manifest,
         (
@@ -786,11 +665,24 @@ def _view_values(view: ProjectView) -> tuple[Any, ...]:
         view.status,
         _gr_update(choices=choices, value=selected),
         preview,
+        view.revision,
+    )
+
+
+def _output_updates(view: ProjectView) -> tuple[Any, ...]:
+    """Return fresh media-component values from one persisted project view."""
+
+    return (
+        _gr_update(value=view.output_audio, visible=bool(view.output_audio)),
+        _gr_update(value=view.stem_audio, visible=bool(view.stem_audio)),
+        _gr_update(value=view.output_video, visible=bool(view.output_video)),
+        _gr_update(value=view.subtitle_files or None, visible=bool(view.subtitle_files)),
+        _gr_update(value=view.subtitle_video, visible=bool(view.subtitle_video)),
     )
 
 
 def _empty_project_updates(message: str) -> tuple[Any, ...]:
-    return (*(_gr_update() for _ in range(9)), message, _gr_update(), _gr_update())
+    return (*(_gr_update() for _ in range(9)), message, _gr_update(), _gr_update(), _gr_update())
 
 
 def _gr_update(**kwargs: Any) -> Any:
@@ -803,6 +695,7 @@ def _run_project_action(
     action: Callable[..., ProjectView],
     *args: Any,
     cancel_event: CancellationToken | None = None,
+    expected_revision: int | None = None,
 ) -> tuple[Any, ...]:
     action_name = getattr(action, "__name__", action.__class__.__name__)
     # All actions that operate on an existing project receive its manifest as
@@ -823,13 +716,19 @@ def _run_project_action(
         return _empty_project_updates("请先新建或打开项目。")
     try:
         logger.info("项目任务开始：%s", action_name)
-        with cancellation_scope(cancel_event):
+        from .lifecycle import browser_revision_scope
+
+        with (
+            cancellation_scope(cancel_event),
+            browser_revision_scope(str(args[0]) if args else "", expected_revision),
+        ):
             if cancel_event is None:
                 result = action(*args)
             else:
                 result = action(*args, cancel_event=cancel_event)
-        logger.info("项目任务完成：%s", action_name)
-        return _view_values(result)
+        rendered = _view_values(result)
+        logger.info("项目任务完成且响应已准备：%s rows=%d", action_name, len(result.rows))
+        return rendered
     except OperationCancelledError as exc:
         logger.info("项目任务已取消：%s", action_name)
         if args:
@@ -864,7 +763,23 @@ def _settings_from_form(
     source_ceiling = form.pop("loudness_source_ceiling_dbfs", None)
     uniform_target = form.pop("loudness_uniform_target_dbfs", None)
     raw_gain = form.pop("loudness_raw_gain_db", None)
+    emotion_vector_fields = (
+        "tts_index25_emotion_happy",
+        "tts_index25_emotion_angry",
+        "tts_index25_emotion_sad",
+        "tts_index25_emotion_afraid",
+        "tts_index25_emotion_disgusted",
+        "tts_index25_emotion_melancholic",
+        "tts_index25_emotion_surprised",
+        "tts_index25_emotion_calm",
+    )
+    emotion_vector = [form.pop(name, None) for name in emotion_vector_fields]
+    if any(value is not None for value in emotion_vector):
+        current["tts_index25_emotion_vector"] = [float(value or 0.0) for value in emotion_vector]
     current.update(form)
+    if current.get("tts_backend") in {"indextts2", "indextts2_5"}:
+        # Browser callbacks can still be updating the model label when Save is clicked.
+        current["tts_model"] = TTS_BACKENDS[current["tts_backend"]].default_model
     if loudness_mode is not None:
         mode = str(loudness_mode)
         if mode not in {"source", "uniform", "raw"}:
@@ -1280,6 +1195,7 @@ _TTS_DEFAULT_URLS = {
     "mimo_tts": "https://api.xiaomimimo.com/v1",
     "minimax": "https://api.minimaxi.com",
 }
+_LOCAL_INDEX_BACKENDS = {"indextts2_5", "indextts2"}
 
 
 def _tts_model_uses_reference(backend: Any, model: Any) -> bool:
@@ -1294,7 +1210,12 @@ def _tts_model_controls_update(backend: Any, model: Any) -> tuple[Any, ...]:
     backend_id = str(backend or "")
     model_id = str(model or "")
     return (
-        _gr_update(visible=_tts_model_uses_reference(backend_id, model_id)),
+        _gr_update(
+            visible=(
+                backend_id not in _LOCAL_INDEX_BACKENDS
+                and _tts_model_uses_reference(backend_id, model_id)
+            )
+        ),
         _gr_update(
             visible=backend_id in {"edge_tts", "minimax"}
             or backend_id == "generic_tts_api"
@@ -1309,12 +1230,15 @@ def _tts_backend_update(backend: Any) -> tuple[Any, ...]:
     backend_id = str(backend or "")
     spec = TTS_BACKENDS.get(backend_id, TTS_BACKENDS["indextts2"])
     url = _TTS_DEFAULT_URLS.get(backend_id, "")
-    device = detect_hardware().recommended_device if backend_id == "indextts2" else "cpu"
+    is_index = backend_id in _LOCAL_INDEX_BACKENDS
+    device = detect_hardware().recommended_device if is_index else "cpu"
     return (
         _gr_update(choices=list(spec.models), value=spec.default_model),
         _gr_update(value=url),
         f"{spec.help}\n\n{spec.setup}",
         service_key_status(f"tts:{backend_id}", spec.api_key),
+        _gr_update(visible=is_index),
+        _gr_update(visible=backend_id == "indextts2_5"),
         _gr_update(visible=backend_id == "indextts2"),
         _gr_update(visible=_tts_model_uses_reference(backend_id, spec.default_model)),
         _gr_update(visible=backend_id == "gpt_sovits"),
@@ -1322,9 +1246,9 @@ def _tts_backend_update(backend: Any) -> tuple[Any, ...]:
         _gr_update(
             choices=[("NVIDIA CUDA（推荐）", "cuda"), ("CPU（非常慢）", "cpu")],
             value=device,
-            visible=backend_id == "indextts2",
+            visible=is_index,
         ),
-        _gr_update(visible=backend_id != "indextts2"),
+        _gr_update(visible=not is_index),
         _gr_update(visible=backend_id == "gpt_sovits"),
         _gr_update(visible=backend_id in {"gpt_sovits", "edge_tts", "minimax", "generic_tts_api"}),
         _gr_update(choices=list(spec.voices), value=spec.default_voice),
@@ -1332,10 +1256,18 @@ def _tts_backend_update(backend: Any) -> tuple[Any, ...]:
     )
 
 
+def _tts_backend_visibility_update(backend: Any) -> tuple[Any, ...]:
+    """Hydration changes visibility, never saved model/URL/voice/device."""
+    return tuple(
+        {k: v for k, v in update.items() if k != "value"} if isinstance(update, dict) else update
+        for update in _tts_backend_update(backend)
+    )
+
+
 def _tts_service_visibility(backend: Any) -> tuple[Any, ...]:
     backend_id = str(backend or "")
     spec = TTS_BACKENDS.get(backend_id, TTS_BACKENDS["indextts2"])
-    configurable_url = backend_id not in {"indextts2", "edge_tts"}
+    configurable_url = backend_id not in {*_LOCAL_INDEX_BACKENDS, "edge_tts"}
     return (
         _gr_update(visible=configurable_url),
         _gr_update(visible=configurable_url),
@@ -1356,7 +1288,7 @@ def _tts_detail_visibility(
     """Hide reference controls that the active TTS mode cannot consume."""
 
     backend_id = str(backend or "")
-    is_index = backend_id == "indextts2"
+    is_index = backend_id in _LOCAL_INDEX_BACKENDS
     uses_reference = _tts_model_uses_reference(backend_id, model)
     external_speaker = (
         str(index_speaker_source or "") == "external"
@@ -1380,6 +1312,7 @@ def _tts_detail_visibility(
         _gr_update(visible=external_reference_language),
         _gr_update(visible=is_index and str(index_emotion_source or "") == "external"),
         _gr_update(visible=is_index and str(index_emotion_source or "") == "text"),
+        _gr_update(visible=is_index and str(index_emotion_source or "") == "vector"),
     )
 
 
@@ -1495,9 +1428,13 @@ def build_app() -> Any:
                                 visible=False,
                             )
                             project_summary = gr.Markdown(
-                                "尚未打开项目。新建项目的音频语言在“设置 → "
-                                "ASR（语音识别）”中选择。",
+                                "尚未打开项目。请先选择下方音频语言，再新建或打开项目。",
                                 elem_id="project-summary",
+                            )
+                            new_source_language = gr.Radio(
+                                choices=[("日语", "ja"), ("英语", "en")],
+                                value=stored.default_source_language,
+                                label="本次新建项目的音频语言",
                             )
 
                         with gr.Accordion(
@@ -1544,6 +1481,37 @@ def build_app() -> Any:
                                 variant="primary",
                             )
 
+                        with gr.Accordion("音频复核提案：试听、采纳与撤销", open=False):
+                            gr.Markdown(
+                                "这是 **ASR → 多模型音频片段复核** 的结果面板，"
+                                "普通单模型识别不需要使用。"
+                                "先在设置中启用该功能并应用到当前项目，再运行 ASR 或只重试复核。"
+                                "默认仅提出建议：完成后在此选择片段、试听、比较候选，再采纳或保留主稿。"
+                                "**实验性，效果可能不如单模型。** 图文步骤见使用指南。"
+                            )
+                            review_status = gr.Markdown("启用音频片段复核后，可在这里查看差异。")
+                            review_refresh = gr.Button("刷新复核结果")
+                            review_table = gr.Dataframe(
+                                headers=["片段", "时间", "证据状态", "处理", "主稿", "候选"],
+                                interactive=False,
+                                type="array",
+                            )
+                            review_window = gr.Dropdown(label="复核音频片段", choices=[])
+                            review_candidate = gr.Dropdown(label="候选文字", choices=[])
+                            review_diff = gr.HTML()
+                            review_audio = gr.Audio(
+                                label="原音频片段（含上下文，保留原声道）",
+                                type="filepath",
+                                interactive=False,
+                            )
+                            with gr.Row():
+                                review_accept = gr.Button("采纳所选候选")
+                                review_keep = gr.Button("保留并确认主稿")
+                                review_undo = gr.Button("撤销上一次采纳或确认")
+                            review_retry = gr.Button("只重试音频复核（不重跑完整主 ASR）")
+                            review_unlock = gr.Button("解除人工确认锁定（允许重新识别）")
+                            review_align = gr.Button("文字确认后：仅重新对齐时间（Qwen3）")
+
                         gr.Markdown("## 制作流程")
                         with gr.Row(
                             equal_height=True,
@@ -1565,17 +1533,20 @@ def build_app() -> Any:
 
                         sentence_table = gr.Dataframe(
                             headers=TABLE_HEADERS,
-                            datatype=cast(Any, TABLE_TYPES),
+                            datatype="str",
+                            type="array",
                             value=[],
                             interactive=True,
-                            wrap=True,
+                            wrap=False,
+                            max_chars=160,
                             column_count=len(TABLE_HEADERS),
                             label="句子校对表格",
                             elem_classes=["sentence-table"],
                         )
                         gr.Markdown(
                             "可以直接修改启用状态、时间、原文和中文。把一行的原文与中文都清空，"
-                            "保存后会删除该句。"
+                            "保存后会删除该句。启用列填写 true/false 或 是/否；"
+                            "长文本仅在显示时收起，双击单元格可编辑完整内容。"
                         )
 
                         with gr.Accordion(
@@ -1592,6 +1563,7 @@ def build_app() -> Any:
                                     scale=3,
                                 )
                                 save_reference_button = gr.Button("设为项目音色参考", scale=1)
+                                preview_reference_button = gr.Button("试听当前参考句", scale=1)
                             reference_audio = gr.Audio(
                                 label="参考句试听",
                                 type="filepath",
@@ -1930,8 +1902,9 @@ def build_app() -> Any:
 
             with gr.Tab("设置", id="settings"):
                 gr.Markdown(
-                    "保存后会作为以后新建项目的默认设置；如果当前已打开项目，也会立即应用到"
-                    "当前项目。API 密钥保存在程序目录的 `.asmr-dubber/config/secrets.json`。"
+                    "这里是设置草稿，切换页签不会丢失修改。保存前请选择作用范围；"
+                    "默认只修改新项目默认值，不会覆盖已打开的项目。应用到当前项目会使用整份草稿。"
+                    "API 密钥保存在程序目录的 `.asmr-dubber/config/secrets.json`。"
                 )
                 settings_status = gr.Textbox(
                     label="设置状态",
@@ -2226,14 +2199,16 @@ def build_app() -> Any:
                             visible=initial_aligner_ready,
                             info="识别文字不变；该模型只重新寻找每句话的起止时间。",
                         )
-                        with gr.Accordion("多模型交叉校对（实验性）", open=False):
+                        with gr.Accordion("多模型音频片段复核", open=False):
                             gr.Markdown(
-                                "**实验性，不建议作为默认方案。多模型结果可能不如单模型。** "
-                                "不同模型的分句差异、共同误识别或大模型判断错误都可能降低准确率；"
-                                "重要内容请人工核对。"
+                                "**实验性，效果可能不如单模型。** "
+                                "各模型识别同一批原音频片段，不按句号编号投票。主稿先保存，"
+                                "默认只生成可试听的更正提案，不需要大模型或翻译 API。"
+                                "自动模式仍是实验性：只接受主模型复听与另一模型家族的完全一致候选；"
+                                "数字、否定和边界不清的变化保留人工确认。多模型可能不如单模型。"
                             )
                             settings_components["asr_review_enabled"] = gr.Checkbox(
-                                label="启用多 ASR（语音识别）+ 大模型交叉校对",
+                                label="启用统一音频片段复核",
                                 value=initial_review_enabled,
                                 interactive=bool(initial_review_choices),
                                 info="下面只列出本地已完整下载并可运行的识别模型。",
@@ -2244,41 +2219,60 @@ def build_app() -> Any:
                                 value=initial_review_models,
                                 visible=initial_review_enabled,
                             )
-                            settings_components["asr_review_text_priority_model"] = gr.Dropdown(
-                                label="主文字来源",
-                                choices=initial_review_choices,
-                                value=initial_review_text_priority,
-                                visible=initial_review_enabled,
+                            settings_components["asr_review_mode"] = gr.Radio(
+                                label="复核结果处理方式",
+                                choices=[
+                                    ("仅提出建议（推荐）", "suggest"),
+                                    ("保守自动纠错（实验性）", "conservative"),
+                                ],
+                                value=asr_stored.asr_review_mode,
                             )
-                            settings_components["asr_review_timestamp_priority_model"] = (
-                                gr.Dropdown(
-                                    label="最终时间戳来源",
-                                    choices=initial_timestamp_choices,
-                                    value=initial_review_timestamp_priority,
+                            settings_components["asr_review_window_seconds"] = gr.Number(
+                                label="统一音频片段目标秒数",
+                                value=asr_stored.asr_review_window_seconds,
+                            )
+                            settings_components["asr_review_context_seconds"] = gr.Number(
+                                label="复核音频上下文秒数",
+                                value=asr_stored.asr_review_context_seconds,
+                            )
+                            with gr.Group(
+                                visible=False
+                            ):  # Legacy settings stay readable, never drive v2 decisions.
+                                settings_components["asr_review_text_priority_model"] = gr.Dropdown(
+                                    label="主文字来源",
+                                    choices=initial_review_choices,
+                                    value=initial_review_text_priority,
                                     visible=initial_review_enabled,
-                                    info=(
-                                        "可使用某个已下载 ASR 的自带时间戳，或用"
-                                        " Qwen3 ForcedAligner 对齐校对后的最终文字。"
-                                    ),
                                 )
-                            )
-                            settings_components["asr_review_max_drift_seconds"] = gr.Number(
-                                label="允许时间漂移秒数",
-                                value=asr_stored.asr_review_max_drift_seconds,
-                                visible=initial_review_enabled,
-                            )
-                            settings_components["asr_review_background"] = gr.Textbox(
-                                label="作品、人物与场景背景",
-                                value=asr_stored.asr_review_background,
-                                lines=4,
-                                visible=initial_review_enabled,
-                            )
-                            settings_components["asr_review_prompt"] = gr.Textbox(
-                                label="ASR（语音识别）校对提示词（Prompt）",
-                                value=asr_stored.asr_review_prompt,
-                                lines=10,
-                                visible=initial_review_enabled,
-                            )
+                                settings_components["asr_review_timestamp_priority_model"] = (
+                                    gr.Dropdown(
+                                        label="最终时间戳来源",
+                                        choices=initial_timestamp_choices,
+                                        value=initial_review_timestamp_priority,
+                                        visible=initial_review_enabled,
+                                        info=(
+                                            "可使用某个已下载 ASR 的自带时间戳，或用"
+                                            " Qwen3 ForcedAligner 对齐校对后的最终文字。"
+                                        ),
+                                    )
+                                )
+                                settings_components["asr_review_max_drift_seconds"] = gr.Number(
+                                    label="允许时间漂移秒数",
+                                    value=asr_stored.asr_review_max_drift_seconds,
+                                    visible=initial_review_enabled,
+                                )
+                                settings_components["asr_review_background"] = gr.Textbox(
+                                    label="作品、人物与场景背景",
+                                    value=asr_stored.asr_review_background,
+                                    lines=4,
+                                    visible=initial_review_enabled,
+                                )
+                                settings_components["asr_review_prompt"] = gr.Textbox(
+                                    label="ASR（语音识别）校对提示词（Prompt）",
+                                    value=asr_stored.asr_review_prompt,
+                                    lines=10,
+                                    visible=initial_review_enabled,
+                                )
 
                     with gr.Tab("翻译", id="translation"):
                         translation_usage = gr.Markdown(
@@ -2414,6 +2408,9 @@ def build_app() -> Any:
                             )
 
                     with gr.Tab("TTS（语音合成）", id="tts"):
+                        load_tts_settings_button = gr.Button(
+                            "载入当前项目的 TTS 设置（替换本页草稿）"
+                        )
                         tts_usage = gr.Markdown(
                             _backend_usage_markdown(
                                 "tts",
@@ -2515,9 +2512,9 @@ def build_app() -> Any:
                                     ("CPU（非常慢）", "cpu"),
                                 ],
                                 value=stored.tts_device,
-                                visible=stored.tts_backend == "indextts2",
+                                visible=stored.tts_backend in _LOCAL_INDEX_BACKENDS,
                                 info=(
-                                    "IndexTTS2 可以使用 CPU，但通常比 CUDA 慢很多；"
+                                    "本地 IndexTTS 可以使用 CPU，但通常比 CUDA 慢很多；"
                                     "Edge TTS 和云端 API 不使用这里的设备设置。"
                                 ),
                             )
@@ -2530,7 +2527,7 @@ def build_app() -> Any:
                                 maximum=8,
                                 step=1,
                                 value=stored.tts_request_concurrency,
-                                visible=stored.tts_backend != "indextts2",
+                                visible=stored.tts_backend not in _LOCAL_INDEX_BACKENDS,
                             )
                         settings_components["tts_speed"] = gr.Number(
                             label="语速",
@@ -2543,9 +2540,12 @@ def build_app() -> Any:
                             settings_components["tts_temperature"] = gr.Number(
                                 label="随机度（Temperature）",
                                 value=stored.tts_temperature,
+                                info="数值越高，输出变化越大。",
                             )
                             settings_components["tts_top_p"] = gr.Number(
-                                label="核采样概率（Top P）", value=stored.tts_top_p
+                                label="核采样概率（Top P）",
+                                value=stored.tts_top_p,
+                                info="只在累计概率范围内采样。",
                             )
 
                         saved_speaker = stored.tts_external_reference_audio or "无"
@@ -2553,7 +2553,7 @@ def build_app() -> Any:
                             stored.tts_backend, stored.tts_model
                         ) and (
                             stored.tts_index_speaker_source == "external"
-                            if stored.tts_backend == "indextts2"
+                            if stored.tts_backend in _LOCAL_INDEX_BACKENDS
                             else stored.tts_reference_source == "external"
                         )
                         with gr.Group(visible=external_speaker_visible) as external_speaker_group:
@@ -2565,7 +2565,7 @@ def build_app() -> Any:
                             gr.Markdown(f"当前已保存音色参考：`{saved_speaker}`")
                         with gr.Group(
                             visible=(
-                                stored.tts_backend != "indextts2"
+                                stored.tts_backend not in _LOCAL_INDEX_BACKENDS
                                 and _tts_model_uses_reference(stored.tts_backend, stored.tts_model)
                             )
                         ) as generic_tts_group:
@@ -2613,12 +2613,12 @@ def build_app() -> Any:
                         settings_components["tts_api_base_url"] = gr.Textbox(
                             label="TTS（语音合成）API（接口）基础地址",
                             value=stored.tts_api_base_url,
-                            visible=stored.tts_backend not in {"indextts2", "edge_tts"},
+                            visible=stored.tts_backend not in {*_LOCAL_INDEX_BACKENDS, "edge_tts"},
                         )
                         settings_components["tts_api_extra_body"] = gr.Textbox(
                             label="TTS（语音合成）API 附加请求参数（JSON，可选）",
                             value=stored.tts_api_extra_body,
-                            visible=stored.tts_backend not in {"indextts2", "edge_tts"},
+                            visible=stored.tts_backend not in {*_LOCAL_INDEX_BACKENDS, "edge_tts"},
                             lines=3,
                             info="可传递服务商特有字段；不要覆盖 model、input。",
                         )
@@ -2646,25 +2646,206 @@ def build_app() -> Any:
                             visible=tts_spec.runtime == "http",
                         )
 
-                        with gr.Group(visible=stored.tts_backend == "indextts2") as index_group:
-                            gr.Markdown("### IndexTTS2 参数")
-                            settings_components["tts_model_path"] = gr.Textbox(
-                                label="IndexTTS2 模型权重目录（checkpoints）",
-                                value=stored.tts_model_path,
-                            )
-                            settings_components["tts_config_path"] = gr.Textbox(
-                                label="IndexTTS2 配置文件（config.yaml）",
-                                value=stored.tts_config_path,
-                            )
-                            index_status = gr.Textbox(
-                                label="IndexTTS2 状态",
-                                value=indextts_installation_status(stored.tts_model_path),
-                                interactive=False,
-                            )
-                            settings_components["tts_index_use_fp16"] = gr.Checkbox(
-                                label="使用半精度计算（FP16）",
-                                value=stored.tts_index_use_fp16,
-                            )
+                        with gr.Group(
+                            visible=stored.tts_backend in _LOCAL_INDEX_BACKENDS
+                        ) as index_group:
+                            with gr.Group(
+                                visible=stored.tts_backend == "indextts2_5"
+                            ) as index25_runtime_group:
+                                gr.Markdown("### IndexTTS-2.5 参数")
+                                settings_components["tts_index25_model_path"] = gr.Textbox(
+                                    label="模型权重目录（checkpoints）",
+                                    value=stored.tts_index25_model_path,
+                                )
+                                settings_components["tts_index25_config_path"] = gr.Textbox(
+                                    label="配置文件（config.yaml）",
+                                    value=stored.tts_index25_config_path,
+                                )
+                                index25_status = gr.Textbox(
+                                    label="IndexTTS-2.5 状态",
+                                    value=indextts25_installation_status(
+                                        stored.tts_index25_model_path
+                                    ),
+                                    interactive=False,
+                                )
+                                with gr.Row():
+                                    settings_components["tts_index25_language"] = gr.Dropdown(
+                                        label="合成语言",
+                                        choices=[
+                                            ("中文", "zh"),
+                                            ("英语", "en"),
+                                            ("日语", "ja"),
+                                            ("西班牙语", "es"),
+                                            ("阿拉伯语", "ar"),
+                                        ],
+                                        value=stored.tts_index25_language,
+                                        info="中文配音通常保持“中文”；仅在文本实际为其它语言时切换。",
+                                    )
+                                    settings_components["tts_index25_duration_factor"] = gr.Slider(
+                                        label="时长倍率",
+                                        minimum=0.5,
+                                        maximum=2.0,
+                                        step=0.05,
+                                        value=stored.tts_index25_duration_factor,
+                                        info=(
+                                            "小于 1 缩短生成音频，大于 1 拉长；"
+                                            "混音仍会按时间窗处理。"
+                                        ),
+                                    )
+                                with gr.Accordion("IndexTTS-2.5 高级设置", open=False):
+                                    gr.Markdown(
+                                        "这些选项会改变速度、显存占用或生成稳定性。"
+                                        "不确定时保留默认值。"
+                                    )
+                                    with gr.Row():
+                                        settings_components["tts_index25_use_bf16"] = gr.Checkbox(
+                                            label="BF16 半精度",
+                                            value=stored.tts_index25_use_bf16,
+                                            info=(
+                                                "支持 BF16 的 NVIDIA 显卡可减少显存占用；"
+                                                "不支持时自动回退全精度。"
+                                            ),
+                                        )
+                                        settings_components["tts_index25_use_cuda_kernel"] = (
+                                            gr.Checkbox(
+                                                label="BigVGAN CUDA 内核",
+                                                value=stored.tts_index25_use_cuda_kernel,
+                                                info=(
+                                                    "可加速声码器，但需要兼容的 CUDA 编译环境；"
+                                                    "默认关闭更稳妥。"
+                                                ),
+                                            )
+                                        )
+                                        settings_components["tts_index25_use_deepspeed"] = (
+                                            gr.Checkbox(
+                                                label="DeepSpeed",
+                                                value=stored.tts_index25_use_deepspeed,
+                                                info=(
+                                                    "使用可选 DeepSpeed 推理；"
+                                                    "未安装或加载失败时由上游回退普通推理。"
+                                                ),
+                                            )
+                                        )
+                                    with gr.Row():
+                                        settings_components["tts_index25_use_accel"] = gr.Checkbox(
+                                            label="GPT 加速引擎",
+                                            value=stored.tts_index25_use_accel,
+                                            info="需要 flash-attn 等可选依赖，兼容性要求较高。",
+                                        )
+                                        settings_components["tts_index25_use_torch_compile"] = (
+                                            gr.Checkbox(
+                                                label="torch.compile",
+                                                value=stored.tts_index25_use_torch_compile,
+                                                info=(
+                                                    "首次编译等待较久，后续可能加速；需要 Triton。"
+                                                ),
+                                            )
+                                        )
+                                        settings_components["tts_index25_text_normalization"] = (
+                                            gr.Checkbox(
+                                                label="文本规范化",
+                                                value=stored.tts_index25_text_normalization,
+                                                info="展开数字、符号等常见写法。使用精确发音标注时可按需要关闭。",
+                                            )
+                                        )
+                                    with gr.Row():
+                                        settings_components["tts_index25_use_random"] = gr.Checkbox(
+                                            label="随机选择情绪/音色条件",
+                                            value=stored.tts_index25_use_random,
+                                            info="增加变化但会降低逐句一致性，批量配音建议关闭。",
+                                        )
+                                        settings_components["tts_index25_interval_silence_ms"] = (
+                                            gr.Number(
+                                                label="内部切段间隔（毫秒）",
+                                                value=stored.tts_index25_interval_silence_ms,
+                                                precision=0,
+                                                info="一句文字被模型拆成多段时，在段间插入的静音。",
+                                            )
+                                        )
+                                        settings_components["tts_index25_max_text_tokens"] = (
+                                            gr.Number(
+                                                label="单段最大文本 Token",
+                                                value=stored.tts_index25_max_text_tokens,
+                                                precision=0,
+                                                info="长句会按此上限切段；减小可降低长文本对齐风险。",
+                                            )
+                                        )
+                                    with gr.Row():
+                                        settings_components["tts_index25_do_sample"] = gr.Checkbox(
+                                            label="启用采样",
+                                            value=stored.tts_index25_do_sample,
+                                            info=(
+                                                "关闭后输出更确定；开启通常更自然，并受 "
+                                                "Temperature、Top P/Top K 控制。"
+                                            ),
+                                        )
+                                        settings_components["tts_index25_temperature"] = gr.Number(
+                                            label="随机度（Temperature）",
+                                            value=stored.tts_index25_temperature,
+                                            info="越高变化越大；官方推荐 0.8。",
+                                        )
+                                        settings_components["tts_index25_top_p"] = gr.Number(
+                                            label="核采样概率（Top P）",
+                                            value=stored.tts_index25_top_p,
+                                            info="只在累计概率范围内采样；官方推荐 0.8。",
+                                        )
+                                    with gr.Row():
+                                        settings_components["tts_index25_top_k"] = gr.Number(
+                                            label="候选数（Top K）",
+                                            value=stored.tts_index25_top_k,
+                                            precision=0,
+                                            info="每步只从概率最高的候选中采样；0 表示不限制。",
+                                        )
+                                        settings_components["tts_index25_num_beams"] = gr.Number(
+                                            label="束搜索数量（Beams）",
+                                            value=stored.tts_index25_num_beams,
+                                            precision=0,
+                                            info="更大可能提高稳定性，也会增加计算量。",
+                                        )
+                                    with gr.Row():
+                                        settings_components["tts_index25_repetition_penalty"] = (
+                                            gr.Number(
+                                                label="重复惩罚",
+                                                value=stored.tts_index25_repetition_penalty,
+                                                info="抑制重复发音；默认 10 为官方推荐值。",
+                                            )
+                                        )
+                                        settings_components["tts_index25_length_penalty"] = (
+                                            gr.Number(
+                                                label="长度惩罚",
+                                                value=stored.tts_index25_length_penalty,
+                                                info="影响束搜索对生成长度的偏好，通常保持 0。",
+                                            )
+                                        )
+                                        settings_components["tts_index25_max_mel_tokens"] = (
+                                            gr.Number(
+                                                label="最大声学 Token",
+                                                value=stored.tts_index25_max_mel_tokens,
+                                                precision=0,
+                                                info="限制单段最长输出；过小可能截断，过大会增加显存和等待时间。",
+                                            )
+                                        )
+                            with gr.Group(
+                                visible=stored.tts_backend == "indextts2"
+                            ) as index2_runtime_group:
+                                gr.Markdown("### IndexTTS2（旧版）参数")
+                                settings_components["tts_model_path"] = gr.Textbox(
+                                    label="模型权重目录（checkpoints）",
+                                    value=stored.tts_model_path,
+                                )
+                                settings_components["tts_config_path"] = gr.Textbox(
+                                    label="配置文件（config.yaml）",
+                                    value=stored.tts_config_path,
+                                )
+                                index_status = gr.Textbox(
+                                    label="IndexTTS2 状态",
+                                    value=indextts_installation_status(stored.tts_model_path),
+                                    interactive=False,
+                                )
+                                settings_components["tts_index_use_fp16"] = gr.Checkbox(
+                                    label="使用半精度计算（FP16）",
+                                    value=stored.tts_index_use_fp16,
+                                )
                             settings_components["tts_index_emo_alpha"] = gr.Slider(
                                 label="情绪权重",
                                 minimum=0,
@@ -2689,6 +2870,7 @@ def build_app() -> Any:
                                     ("跟随音色参考", "speaker_reference"),
                                     ("外部音频", "external"),
                                     ("文字描述", "text"),
+                                    ("八维情绪向量", "vector"),
                                 ],
                                 value=stored.tts_index_emotion_source,
                             )
@@ -2708,6 +2890,36 @@ def build_app() -> Any:
                                 lines=3,
                                 visible=stored.tts_index_emotion_source == "text",
                             )
+                            emotion_vector = list(stored.tts_index25_emotion_vector)
+                            with gr.Group(
+                                visible=stored.tts_index_emotion_source == "vector"
+                            ) as index_emotion_vector_group:
+                                gr.Markdown(
+                                    "八个值依次控制快乐、愤怒、悲伤、害怕、厌恶、低落、惊讶和平静。"
+                                    "模型会自动归一化；情绪权重仍会作用于整个向量。"
+                                )
+                                vector_names = (
+                                    ("tts_index25_emotion_happy", "快乐"),
+                                    ("tts_index25_emotion_angry", "愤怒"),
+                                    ("tts_index25_emotion_sad", "悲伤"),
+                                    ("tts_index25_emotion_afraid", "害怕"),
+                                    ("tts_index25_emotion_disgusted", "厌恶"),
+                                    ("tts_index25_emotion_melancholic", "低落"),
+                                    ("tts_index25_emotion_surprised", "惊讶"),
+                                    ("tts_index25_emotion_calm", "平静"),
+                                )
+                                for row_start in (0, 4):
+                                    with gr.Row():
+                                        for offset, (field, label) in enumerate(
+                                            vector_names[row_start : row_start + 4]
+                                        ):
+                                            settings_components[field] = gr.Slider(
+                                                label=label,
+                                                minimum=0,
+                                                maximum=1,
+                                                step=0.05,
+                                                value=emotion_vector[row_start + offset],
+                                            )
                         with gr.Group(visible=stored.tts_backend == "gpt_sovits") as gpt_group:
                             gr.Markdown("### GPT-SoVITS API 参数")
                             settings_components["tts_gpt_top_k"] = gr.Number(
@@ -3056,6 +3268,15 @@ def build_app() -> Any:
                                 info="只作为视频任务的初始值；批量页扫描后可以改选作品图片。",
                             )
 
+                settings_scope = gr.Radio(
+                    choices=[
+                        ("仅新项目默认值", "defaults"),
+                        ("仅当前项目", "project"),
+                        ("两者", "both"),
+                    ],
+                    value="defaults",
+                    label="设置保存范围",
+                )
                 save_settings_button = gr.Button("保存设置", variant="primary")
 
             with gr.Tab("日志与诊断", id="logs"):
@@ -3076,6 +3297,58 @@ def build_app() -> Any:
                     interactive=False,
                 )
 
+        project_revision = gr.State(None)
+        workflow_buttons = [
+            asr_button,
+            translate_button,
+            save_table_button,
+            synthesize_button,
+            mix_button,
+        ]
+
+        def workflow_availability(manifest: str, table: Any) -> tuple[Any, ...]:
+            opened = bool(str(manifest or "").strip())
+            rows = table.get("data", []) if isinstance(table, dict) else table
+            if hasattr(rows, "values"):
+                rows = rows.values.tolist()
+            rows = rows if isinstance(rows, list) else []
+            has_text = any(
+                len(row) >= 6
+                and str(row[1]).strip().casefold() in {"true", "1", "yes", "是"}
+                and str(row[5] or "").strip()
+                for row in rows
+            )
+            return tuple(
+                gr.update(interactive=enabled)
+                for enabled in (
+                    opened,
+                    opened and bool(rows),
+                    opened and bool(rows),
+                    opened and has_text,
+                    opened and has_text,
+                )
+            )
+
+        app.load(
+            lambda: tuple(gr.update(interactive=False) for _ in workflow_buttons),
+            outputs=workflow_buttons,
+            queue=False,
+            api_name=_PRIVATE_API,
+        )
+        project_path.change(
+            workflow_availability,
+            inputs=[project_path, sentence_table],
+            outputs=workflow_buttons,
+            queue=False,
+            api_name=_PRIVATE_API,
+        )
+        sentence_table.change(
+            workflow_availability,
+            inputs=[project_path, sentence_table],
+            outputs=workflow_buttons,
+            queue=False,
+            api_name=_PRIVATE_API,
+        )
         common_outputs = [
             project_path,
             project_summary,
@@ -3089,6 +3362,7 @@ def build_app() -> Any:
             status,
             reference_sentence,
             reference_audio,
+            project_revision,
         ]
         runtime_options = {
             "concurrency_id": "runtime_mutation",
@@ -3100,6 +3374,7 @@ def build_app() -> Any:
             label: str,
             action: Callable[..., ProjectView],
             *args: Any,
+            expected_revision: int | None = None,
         ) -> tuple[Any, ...]:
             task_controller.begin(label)
             try:
@@ -3107,6 +3382,7 @@ def build_app() -> Any:
                     action,
                     *args,
                     cancel_event=task_controller.cancel_event,
+                    expected_revision=expected_revision,
                 )
             finally:
                 task_controller.finish(label)
@@ -3150,6 +3426,7 @@ def build_app() -> Any:
         def asr_callback(
             manifest: str,
             table: Any,
+            revision: int | None,
             progress: gr.Progress = gr.Progress(),
         ) -> tuple[Any, ...]:
             return run_project_task(
@@ -3158,6 +3435,7 @@ def build_app() -> Any:
                 manifest,
                 table,
                 _StageProgress(progress),
+                expected_revision=revision,
             )
 
         def import_transcript_callback(
@@ -3166,6 +3444,7 @@ def build_app() -> Any:
             text: str,
             timing: str,
             script_kind: str,
+            revision: int | None,
             progress: gr.Progress = gr.Progress(),
         ) -> tuple[Any, ...]:
             return run_project_task(
@@ -3177,11 +3456,13 @@ def build_app() -> Any:
                 timing,
                 script_kind,
                 _StageProgress(progress),
+                expected_revision=revision,
             )
 
         def translate_callback(
             manifest: str,
             table: Any,
+            revision: int | None,
             progress: gr.Progress = gr.Progress(),
         ) -> tuple[Any, ...]:
             return run_project_task(
@@ -3190,14 +3471,16 @@ def build_app() -> Any:
                 manifest,
                 table,
                 _StageProgress(progress),
+                expected_revision=revision,
             )
 
-        def save_table_callback(manifest: str, table: Any) -> tuple[Any, ...]:
-            return _run_project_action(save_table, manifest, table)
+        def save_table_callback(manifest: str, table: Any, revision: int | None) -> tuple[Any, ...]:
+            return _run_project_action(save_table, manifest, table, expected_revision=revision)
 
         def synthesize_callback(
             manifest: str,
             table: Any,
+            revision: int | None,
             progress: gr.Progress = gr.Progress(),
         ) -> tuple[Any, ...]:
             return run_project_task(
@@ -3206,11 +3489,13 @@ def build_app() -> Any:
                 manifest,
                 table,
                 _StageProgress(progress),
+                expected_revision=revision,
             )
 
         def mix_callback(
             manifest: str,
             table: Any,
+            revision: int | None,
             progress: gr.Progress = gr.Progress(),
         ) -> tuple[Any, ...]:
             return run_project_task(
@@ -3219,12 +3504,23 @@ def build_app() -> Any:
                 manifest,
                 table,
                 _StageProgress(progress),
+                expected_revision=revision,
             )
+
+        def refresh_output_files_callback(manifest: str) -> tuple[Any, ...]:
+            if not str(manifest or "").strip():
+                return tuple(gr.update() for _ in range(5))
+            try:
+                return _output_updates(load_view(manifest))
+            except Exception:
+                logger.exception("刷新项目输出预览失败")
+                return tuple(gr.update() for _ in range(5))
 
         def subtitle_callback(
             manifest: str,
             table: Any,
             language: str,
+            revision: int | None,
             progress: gr.Progress = gr.Progress(),
         ) -> tuple[Any, ...]:
             return run_project_task(
@@ -3234,6 +3530,7 @@ def build_app() -> Any:
                 table,
                 language,
                 _StageProgress(progress),
+                expected_revision=revision,
             )
 
         def preview_reference_callback(manifest: str, sentence_id: str) -> Any:
@@ -3696,15 +3993,21 @@ def build_app() -> Any:
                 logger.exception("打开自动处理输出目录失败")
                 return f"无法打开输出目录：{_safe_error(exc)}"
 
-        def pick_reference_callback(manifest: str, sentence_id: str) -> tuple[Any, Any]:
+        def pick_reference_callback(
+            manifest: str, sentence_id: str, revision: int | None
+        ) -> tuple[Any, ...]:
             try:
-                return select_reference(manifest, sentence_id)
+                from .lifecycle import browser_revision_scope
+
+                with browser_revision_scope(manifest, revision):
+                    message, preview = select_reference(manifest, sentence_id)
+                    return message, preview, load_view(manifest).revision
             except Exception as exc:
-                return f"保存参考句失败：{_safe_error(exc)}", gr.update()
+                return f"保存参考句失败：{_safe_error(exc)}", gr.update(), gr.update()
 
         create_button.click(
             create_callback,
-            inputs=[source_input, settings_components["default_source_language"]],
+            inputs=[source_input, new_source_language],
             outputs=common_outputs,
             api_name="create_project",
             **runtime_options,
@@ -3736,9 +4039,9 @@ def build_app() -> Any:
             api_name=_PRIVATE_API,
             queue=False,
         )
-        asr_button.click(
+        asr_event = asr_button.click(
             asr_callback,
-            inputs=[project_path, sentence_table],
+            inputs=[project_path, sentence_table, project_revision],
             outputs=common_outputs,
             api_name="run_asr",
             **runtime_options,
@@ -3751,6 +4054,7 @@ def build_app() -> Any:
                 transcript_text,
                 plain_timing,
                 transcript_kind,
+                project_revision,
             ],
             outputs=common_outputs,
             api_name="import_transcript",
@@ -3765,35 +4069,48 @@ def build_app() -> Any:
         )
         translate_button.click(
             translate_callback,
-            inputs=[project_path, sentence_table],
+            inputs=[project_path, sentence_table, project_revision],
             outputs=common_outputs,
             api_name="translate_project",
             **runtime_options,
         )
         save_table_button.click(
             save_table_callback,
-            inputs=[project_path, sentence_table],
+            inputs=[project_path, sentence_table, project_revision],
             outputs=common_outputs,
             api_name="save_sentence_table",
             **runtime_options,
         )
         synthesize_button.click(
             synthesize_callback,
-            inputs=[project_path, sentence_table],
+            inputs=[project_path, sentence_table, project_revision],
             outputs=common_outputs,
             api_name="synthesize_project",
             **runtime_options,
         )
-        mix_button.click(
+        mix_event = mix_button.click(
             mix_callback,
-            inputs=[project_path, sentence_table],
+            inputs=[project_path, sentence_table, project_revision],
             outputs=common_outputs,
             api_name="mix_project",
             **runtime_options,
         )
+        mix_event.then(
+            refresh_output_files_callback,
+            inputs=[project_path],
+            outputs=[
+                output_audio,
+                stem_audio,
+                output_video,
+                subtitle_files,
+                subtitle_video,
+            ],
+            api_name=_PRIVATE_API,
+            queue=False,
+        )
         subtitle_button.click(
             subtitle_callback,
-            inputs=[project_path, sentence_table, subtitle_language],
+            inputs=[project_path, sentence_table, subtitle_language, project_revision],
             outputs=common_outputs,
             api_name="generate_subtitles",
             **runtime_options,
@@ -3804,20 +4121,215 @@ def build_app() -> Any:
             api_name=_PRIVATE_API,
             queue=False,
         )
-        reference_sentence.change(
+        reference_sentence.input(
             preview_reference_callback,
             inputs=[project_path, reference_sentence],
             outputs=[reference_audio],
             api_name=_PRIVATE_API,
             queue=False,
         )
-        save_reference_button.click(
-            pick_reference_callback,
+        preview_reference_button.click(
+            preview_reference_callback,
             inputs=[project_path, reference_sentence],
-            outputs=[status, reference_audio],
+            outputs=[reference_audio],
             api_name=_PRIVATE_API,
             **runtime_options,
         )
+        save_reference_button.click(
+            pick_reference_callback,
+            inputs=[project_path, reference_sentence, project_revision],
+            outputs=[status, reference_audio, project_revision],
+            api_name=_PRIVATE_API,
+            **runtime_options,
+        )
+
+        def refresh_review_callback(manifest: str) -> tuple[Any, ...]:
+            try:
+                rows, choices, message = review_overview(manifest)
+                return (
+                    rows,
+                    gr.update(choices=choices, value=None),
+                    gr.update(choices=[], value=None),
+                    message,
+                    "",
+                    None,
+                )
+            except Exception as exc:
+                return (
+                    [],
+                    gr.update(choices=[], value=None),
+                    gr.update(choices=[], value=None),
+                    _safe_error(exc),
+                    "",
+                    None,
+                )
+
+        review_outputs = [
+            review_table,
+            review_window,
+            review_candidate,
+            review_status,
+            review_diff,
+            review_audio,
+        ]
+        review_refresh.click(
+            refresh_review_callback,
+            inputs=[project_path],
+            outputs=review_outputs,
+            api_name="review_results",
+            **runtime_options,
+        )
+        asr_event.then(
+            refresh_review_callback,
+            inputs=[project_path],
+            outputs=review_outputs,
+            api_name=_PRIVATE_API,
+            queue=False,
+        )
+        project_path.change(
+            refresh_review_callback,
+            inputs=[project_path],
+            outputs=review_outputs,
+            api_name=_PRIVATE_API,
+            queue=False,
+        )
+
+        def select_review_window(manifest: str, identifier: str) -> tuple[Any, ...]:
+            if not identifier:
+                return gr.update(choices=[], value=None), "", None
+            try:
+                choices, body, audio = candidate_details(manifest, identifier)
+                return gr.update(choices=choices, value=None), body, audio
+            except Exception as exc:
+                return gr.update(choices=[], value=None), html.escape(_safe_error(exc)), None
+
+        def select_review_candidate(
+            manifest: str, identifier: str, candidate: str
+        ) -> tuple[Any, Any]:
+            if not identifier or not candidate:
+                return gr.update(), gr.update()
+            try:
+                _, body, audio = candidate_details(manifest, identifier, candidate)
+                return body, audio
+            except Exception as exc:
+                return html.escape(_safe_error(exc)), None
+
+        review_window.change(
+            select_review_window,
+            inputs=[project_path, review_window],
+            outputs=[review_candidate, review_diff, review_audio],
+            api_name=_PRIVATE_API,
+            **runtime_options,
+        )
+        review_candidate.change(
+            select_review_candidate,
+            inputs=[project_path, review_window, review_candidate],
+            outputs=[review_diff, review_audio],
+            api_name=_PRIVATE_API,
+            **runtime_options,
+        )
+
+        def accept_review_callback(
+            manifest: str, identifier: str, candidate: str, table: Any, revision: int | None
+        ) -> tuple[Any, ...]:
+            return _run_project_action(
+                apply_review,
+                manifest,
+                identifier,
+                candidate,
+                False,
+                table,
+                expected_revision=revision,
+            )
+
+        def keep_review_callback(
+            manifest: str, identifier: str, table: Any, revision: int | None
+        ) -> tuple[Any, ...]:
+            return _run_project_action(
+                apply_review, manifest, identifier, "", True, table, expected_revision=revision
+            )
+
+        def undo_review_callback(
+            manifest: str, table: Any, revision: int | None
+        ) -> tuple[Any, ...]:
+            return _run_project_action(undo_review, manifest, table, expected_revision=revision)
+
+        def unlock_review_callback(
+            manifest: str, table: Any, revision: int | None
+        ) -> tuple[Any, ...]:
+            return _run_project_action(unlock_review, manifest, table, expected_revision=revision)
+
+        def retry_review_callback(
+            manifest: str, table: Any, revision: int | None, progress: gr.Progress = gr.Progress()
+        ) -> tuple[Any, ...]:
+            return run_project_task(
+                "音频复核",
+                retry_review,
+                manifest,
+                table,
+                _StageProgress(progress),
+                expected_revision=revision,
+            )
+
+        def align_review_callback(
+            manifest: str, table: Any, revision: int | None, progress: gr.Progress = gr.Progress()
+        ) -> tuple[Any, ...]:
+            return run_project_task(
+                "确认文字后的时间对齐",
+                align_review,
+                manifest,
+                table,
+                _StageProgress(progress),
+                expected_revision=revision,
+            )
+
+        for button, fn, inputs, api in (
+            (
+                review_align,
+                align_review_callback,
+                [project_path, sentence_table, project_revision],
+                "align_review",
+            ),
+            (
+                review_accept,
+                accept_review_callback,
+                [project_path, review_window, review_candidate, sentence_table, project_revision],
+                "accept_review",
+            ),
+            (
+                review_keep,
+                keep_review_callback,
+                [project_path, review_window, sentence_table, project_revision],
+                "keep_review",
+            ),
+            (
+                review_undo,
+                undo_review_callback,
+                [project_path, sentence_table, project_revision],
+                "undo_review",
+            ),
+            (
+                review_unlock,
+                unlock_review_callback,
+                [project_path, sentence_table, project_revision],
+                "unlock_review",
+            ),
+            (
+                review_retry,
+                retry_review_callback,
+                [project_path, sentence_table, project_revision],
+                "retry_review",
+            ),
+        ):
+            button.click(
+                fn, inputs=inputs, outputs=common_outputs, api_name=api, **runtime_options
+            ).then(
+                refresh_review_callback,
+                inputs=[project_path],
+                outputs=review_outputs,
+                api_name=_PRIVATE_API,
+                queue=False,
+            )
         autoflow_scan_button.click(
             autoflow_scan_callback,
             inputs=[autoflow_folder, autoflow_include_bonus],
@@ -4356,29 +4868,32 @@ def build_app() -> Any:
             api_name=_PRIVATE_API,
             queue=False,
         )
+        tts_backend_outputs = [
+            settings_components["tts_model"],
+            settings_components["tts_api_base_url"],
+            tts_help,
+            tts_key_status,
+            index_group,
+            index25_runtime_group,
+            index2_runtime_group,
+            generic_tts_group,
+            gpt_group,
+            cosy_group,
+            settings_components["tts_device"],
+            settings_components["tts_request_concurrency"],
+            tts_sampling_group,
+            settings_components["tts_speed"],
+            settings_components["tts_voice"],
+            tts_voice_group,
+            minimax_group,
+            mimo_group,
+        ]
         tts_backend_event = (
             settings_components["tts_backend"]
             .change(
-                _tts_backend_update,
+                _tts_backend_visibility_update,
                 inputs=[settings_components["tts_backend"]],
-                outputs=[
-                    settings_components["tts_model"],
-                    settings_components["tts_api_base_url"],
-                    tts_help,
-                    tts_key_status,
-                    index_group,
-                    generic_tts_group,
-                    gpt_group,
-                    cosy_group,
-                    settings_components["tts_device"],
-                    settings_components["tts_request_concurrency"],
-                    tts_sampling_group,
-                    settings_components["tts_speed"],
-                    settings_components["tts_voice"],
-                    tts_voice_group,
-                    minimax_group,
-                    mimo_group,
-                ],
+                outputs=tts_backend_outputs,
                 api_name=_PRIVATE_API,
                 queue=False,
             )
@@ -4396,6 +4911,13 @@ def build_app() -> Any:
                 queue=False,
             )
         )
+        settings_components["tts_backend"].input(
+            _tts_backend_update,
+            inputs=[settings_components["tts_backend"]],
+            outputs=tts_backend_outputs,
+            api_name=_PRIVATE_API,
+            queue=False,
+        )
         tts_detail_inputs = [
             settings_components["tts_backend"],
             settings_components["tts_model"],
@@ -4410,6 +4932,7 @@ def build_app() -> Any:
             settings_components["tts_external_reference_language"],
             external_emotion_group,
             settings_components["tts_index_emo_text"],
+            index_emotion_vector_group,
         ]
         tts_backend_event.then(
             _tts_detail_visibility,
@@ -4492,6 +5015,13 @@ def build_app() -> Any:
             api_name=_PRIVATE_API,
             queue=False,
         )
+        settings_components["tts_index25_model_path"].change(
+            indextts25_installation_status,
+            inputs=[settings_components["tts_index25_model_path"]],
+            outputs=[index25_status],
+            api_name=_PRIVATE_API,
+            queue=False,
+        )
         settings_components["chinese_dubbing_timing_mode"].change(
             lambda mode: gr.update(visible=str(mode or "fit_window") == "fit_window"),
             inputs=[settings_components["chinese_dubbing_timing_mode"]],
@@ -4560,6 +5090,85 @@ def build_app() -> Any:
         field_names = list(settings_components)
         field_components = [settings_components[name] for name in field_names]
         form_inputs = [*field_components, external_speaker_upload, external_emotion_upload]
+        tts_form_names = [name for name in field_names if name.startswith("tts_")]
+        tts_form_components = [settings_components[name] for name in tts_form_names]
+
+        def refresh_tts_form_callback(manifest: str) -> tuple[Any, ...]:
+            try:
+                effective, scope = _settings_in_effect(manifest)
+                spec = TTS_BACKENDS.get(effective.tts_backend, TTS_BACKENDS["edge_tts"])
+                vector_fields = {
+                    "tts_index25_emotion_happy": 0,
+                    "tts_index25_emotion_angry": 1,
+                    "tts_index25_emotion_sad": 2,
+                    "tts_index25_emotion_afraid": 3,
+                    "tts_index25_emotion_disgusted": 4,
+                    "tts_index25_emotion_melancholic": 5,
+                    "tts_index25_emotion_surprised": 6,
+                    "tts_index25_emotion_calm": 7,
+                }
+                updates: list[Any] = []
+                for name in tts_form_names:
+                    if name in vector_fields:
+                        value = effective.tts_index25_emotion_vector[vector_fields[name]]
+                    else:
+                        value = getattr(effective, name)
+                    if name == "tts_model":
+                        updates.append(gr.update(choices=list(spec.models), value=value))
+                    elif name == "tts_voice":
+                        updates.append(
+                            gr.update(
+                                choices=list(spec.voices),
+                                value=value or spec.default_voice,
+                            )
+                        )
+                    else:
+                        updates.append(gr.update(value=value))
+                return (
+                    f"已载入{scope}的 TTS（语音合成）设置。",
+                    *updates,
+                    _backend_usage_markdown(
+                        "tts",
+                        manifest,
+                        effective.tts_backend,
+                        effective.tts_model,
+                        effective.tts_api_base_url,
+                    ),
+                )
+            except Exception as exc:
+                logger.exception("刷新 TTS 设置失败")
+                return (
+                    f"刷新 TTS（语音合成）设置失败：{_safe_error(exc)}",
+                    *[gr.update() for _ in tts_form_components],
+                    gr.update(),
+                )
+
+        tts_refresh_outputs = [settings_status, *tts_form_components, tts_usage]
+        # build_app() lives for the process; hydration must read disk per page load.
+        app.load(
+            refresh_tts_form_callback,
+            inputs=[project_path],
+            outputs=tts_refresh_outputs,
+            api_name=_PRIVATE_API,
+            queue=False,
+            show_progress="hidden",
+        )
+        # No automatic form hydration: an opened project must not overwrite drafts.
+        load_tts_settings_button.click(
+            refresh_tts_form_callback,
+            inputs=[project_path],
+            outputs=tts_refresh_outputs,
+            api_name=_PRIVATE_API,
+            queue=False,
+        )
+        for component in field_components:
+            if hasattr(component, "input"):
+                component.input(
+                    lambda: "有未保存修改；切换页签会保留草稿。",
+                    outputs=[settings_status],
+                    queue=False,
+                    api_name=_PRIVATE_API,
+                )
 
         def parse_form(*values: Any) -> UserSettings:
             return _settings_from_form(
@@ -4569,7 +5178,9 @@ def build_app() -> Any:
                 values[-1],
             )
 
-        def apply_settings_callback(manifest: str, *values: Any) -> tuple[Any, ...]:
+        def apply_settings_callback(
+            manifest: str, revision: int | None, scope: str, *values: Any
+        ) -> tuple[Any, ...]:
             try:
                 settings = parse_form(*values)
             except Exception as exc:
@@ -4582,9 +5193,30 @@ def build_app() -> Any:
                     gr.update(),
                 )
             try:
-                path = save_user_settings(settings)
+                normalized_manifest = str(manifest or "").strip()
+                if scope not in {"defaults", "project", "both"}:
+                    raise ValueError("设置保存范围无效。")
+                if scope == "project" and not normalized_manifest:
+                    raise ValueError("请先打开项目，或选择仅新项目默认值。")
+                project_applied = False
+                if scope != "defaults" and normalized_manifest:
+                    from .lifecycle import browser_revision_scope
+
+                    with browser_revision_scope(normalized_manifest, revision):
+                        project_view = apply_global_settings(normalized_manifest, settings)
+                        project_applied = True
+                path = (
+                    save_user_settings(settings)
+                    if scope != "project"
+                    else Path(normalized_manifest)
+                )
             except Exception as exc:
-                message = f"保存新项目默认值失败：{_safe_error(exc)}"
+                message = f"保存设置失败：{_safe_error(exc)}"
+                if locals().get("project_applied", False):
+                    message = "当前项目设置已保存，但新项目默认值保存失败：" + _safe_error(exc)
+                    updates = list(_view_values(project_view))
+                    updates[2] = gr.update()
+                    return (message, *updates, gr.update(), gr.update(), gr.update())
                 return (
                     message,
                     *[gr.update() for _ in common_outputs],
@@ -4594,7 +5226,7 @@ def build_app() -> Any:
                 )
 
             normalized_manifest = str(manifest or "").strip()
-            if not normalized_manifest:
+            if not normalized_manifest or scope == "defaults":
                 message = f"设置已保存：{path}\n以后新建的项目将使用这些设置。"
                 return (
                     message,
@@ -4622,23 +5254,12 @@ def build_app() -> Any:
                     ),
                 )
 
-            try:
-                project_view = apply_global_settings(normalized_manifest, settings)
-            except Exception as exc:
-                project_message = f"新项目默认值已经保存，但应用到当前项目失败：{_safe_error(exc)}"
-                settings_message = f"新项目默认值已保存：{path}\n{project_message}"
-                return (
-                    settings_message,
-                    *[gr.update() for _ in common_outputs],
-                    gr.update(),
-                    gr.update(),
-                    gr.update(),
-                )
-
             settings_message = f"设置已保存：{path}\n{project_view.status}"
+            project_updates = list(_view_values(project_view))
+            project_updates[2] = gr.update()  # Preserve unsaved sentence-table edits.
             return (
                 settings_message,
-                *_view_values(project_view),
+                *project_updates,
                 _backend_usage_markdown(
                     "asr",
                     normalized_manifest,
@@ -4664,7 +5285,7 @@ def build_app() -> Any:
 
         save_settings_button.click(
             apply_settings_callback,
-            inputs=[project_path, *form_inputs],
+            inputs=[project_path, project_revision, settings_scope, *form_inputs],
             outputs=[
                 settings_status,
                 *common_outputs,

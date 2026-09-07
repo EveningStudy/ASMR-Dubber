@@ -1,357 +1,398 @@
+"""Quality failure regressions and executable contracts for audio-window review."""
+
+from __future__ import annotations
+
 import json
+import threading
+from itertools import pairwise
 from pathlib import Path
 
-import httpx
+import numpy as np
+import pytest
+import soundfile as sf
 
-from asmr_dubber.asr_review import _build_windows, _evidence_range, review_transcriptions
-from asmr_dubber.models import ProjectSettings, Sentence
-
-
-def _sentence(identifier: str, start: float, end: float, text: str) -> Sentence:
-    return Sentence(
-        id=identifier,
-        start_seconds=start,
-        end_seconds=end,
-        ja_text=text,
-    )
-
-
-def test_review_windows_ignore_secondary_text_outside_timeline_drift() -> None:
-    primary = [
-        _sentence("p1", 1.0, 2.0, "始めましょう"),
-        _sentence("p2", 4.0, 5.0, "次です"),
-    ]
-    secondary = [
-        _sentence("s1", 1.2, 2.2, "さあ始めましょう"),
-        _sentence("s2", 2.8, 3.2, "聞こえますか"),
-    ]
-
-    windows = _build_windows(
-        [("primary", primary), ("secondary", secondary)],
-        max_drift_seconds=0.5,
-    )
-
-    assert len(windows) == 2
-    assert [len(window.evidence) for window in windows] == [2, 1]
-    assert windows[0].evidence[0].id == "w000001-c01"
+from asmr_dubber.asr_review import (
+    AudioWindow,
+    _candidate,
+    compare_window,
+    normalize_text,
+    plan_windows,
+    replace_window,
+    run_audio_review,
+)
+from asmr_dubber.errors import OperationCancelledError, ProjectError
+from asmr_dubber.models import (
+    AudioInfo,
+    DubProject,
+    ProjectSettings,
+    Sentence,
+    load_project,
+    save_project,
+)
+from asmr_dubber.review_services import apply_review, undo_review
 
 
-def test_long_secondary_segment_is_split_across_every_covered_window() -> None:
-    primary = [
-        _sentence("p1", 0.0, 2.0, "本作の特徴"),
-        _sentence("p2", 2.0, 4.0, "本作の舞台"),
-        _sentence("p3", 4.0, 6.0, "剣と魔法の世界"),
-    ]
-    secondary = [_sentence("s1", 0.0, 6.0, "本作の特徴は、本作の舞台は、剣と魔法の世界。")]
-
-    windows = _build_windows(
-        [("primary", primary), ("faster_whisper|large-v2", secondary)],
-        max_drift_seconds=0.5,
-    )
-
-    fragments = [window.evidence[1].text for window in windows]
-    assert len(fragments) == 3
-    assert all(fragment != secondary[0].source_text for fragment in fragments)
-    assert "本作の特徴" in fragments[0]
-    assert "本作の舞台" in fragments[1]
-    assert "剣と魔法" in fragments[2]
+def row(text: str, start: float = 1, end: float = 3, identifier: str = "s1") -> Sentence:
+    return Sentence(id=identifier, start_seconds=start, end_seconds=end, source_text=text)
 
 
-def test_evidence_time_keeps_primary_window_by_default() -> None:
-    primary = [_sentence("p1", 10.0, 12.0, "こんにちは")]
-    alternatives = [
-        _sentence("a1", 10.2, 12.2, "こんにちは"),
-        _sentence("b1", 9.8, 11.8, "こんにちは"),
-    ]
-    window = _build_windows(
-        [
-            ("primary", primary),
-            ("alternative-a", alternatives[:1]),
-            ("alternative-b", alternatives[1:]),
-        ],
-        max_drift_seconds=1.0,
-    )[0]
-
-    start, end = _evidence_range(window, [item.id for item in window.evidence])
-
-    assert start == 10.0
-    assert end == 12.0
-
-
-def test_evidence_time_honors_timestamp_priority_source() -> None:
-    primary = [_sentence("p1", 10.0, 12.0, "こんにちは")]
-    alternative = [_sentence("a1", 10.4, 11.7, "こんにちは")]
-    window = _build_windows(
-        [("primary", primary), ("time-priority", alternative)],
-        max_drift_seconds=1.0,
-    )[0]
-
-    start, end = _evidence_range(
-        window,
-        [window.evidence[0].id],
-        "time-priority",
-    )
-
-    assert start == 10.4
-    assert end == 11.7
-
-
-def _settings() -> ProjectSettings:
+def settings(**kwargs) -> ProjectSettings:
     return ProjectSettings(
-        asr_backend="faster_whisper",
-        asr_model="large-v2",
+        asr_backend="parakeet_nemo",
+        asr_model="model",
         asr_review_enabled=True,
-        asr_review_models=["kotoba_whisper|kotoba-tech/kotoba-whisper-v2.2"],
-        asr_review_text_priority_model="faster_whisper|large-v2",
-        asr_review_timestamp_priority_model="faster_whisper|large-v2",
+        asr_review_models=["faster_whisper|large-v2"],
+        **kwargs,
     )
 
 
-def _transcriptions(*texts: tuple[str, str]) -> list[tuple[str, list[Sentence]]]:
-    return [
-        (label, [_sentence(f"{index}", 1.0, 2.0, text)])
-        for index, (label, text) in enumerate(texts, start=1)
-    ]
+def audio(tmp_path: Path, duration: int = 8) -> Path:
+    path = tmp_path / "source.wav"
+    sf.write(path, np.zeros(16000 * duration, dtype=np.float32), 16000)
+    return path
 
 
-def test_consensus_skips_llm_and_records_decision(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(
-        "asmr_dubber.asr_review._request_json",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("LLM should not run")),
+def fake_runner(texts: dict[str, list[Sentence]], calls: list | None = None):
+    def run(jobs, configured, language, cancel, progress):
+        for identifier, path in jobs:
+            if calls is not None:
+                calls.append((configured.asr_backend, identifier, path.read_bytes()))
+            yield identifier, texts[configured.asr_backend], None
+
+    return run
+
+
+def test_different_segmentation_and_timestamps_are_not_a_conflict(tmp_path):
+    baseline = [row("今日は寒い。", 1, 2), row("早く帰ろう。", 2.5, 5, "s2")]
+    before = [s.model_dump() for s in baseline]
+    runner = fake_runner(
+        {"parakeet_nemo": baseline, "faster_whisper": [row("今日は寒い、早く帰ろう。", 0.3, 6)]}
     )
-    report = tmp_path / "review.json"
-
-    sentences = review_transcriptions(
-        _transcriptions(
-            ("parakeet_nemo|model", "こんにちは。"),
-            ("faster_whisper|large-v2", "こんにちは"),
-        ),
-        _settings(),
-        report,
+    calls = []
+    runner = fake_runner(
+        {"parakeet_nemo": baseline, "faster_whisper": [row("今日は寒い、早く帰ろう。", 0.3, 6)]},
+        calls,
     )
-
-    assert [item.source_text for item in sentences] == ["こんにちは。"]
+    report = tmp_path / "analysis/asr_review.json"
+    output = run_audio_review(audio(tmp_path), baseline, settings(), report, runner=runner)
+    assert [s.model_dump() for s in output] == before
     result = json.loads(report.read_text(encoding="utf-8"))["results"][0]
-    assert result["decision"] == "consensus"
-    assert result["selected_candidate"] == 1
+    assert result["status"] == "agreement"
+    assert len(result["candidates"]) == 1
+    assert result["confidence"] is None
+    assert calls[0][2] == calls[1][2]
 
 
-def test_majority_vote_beats_dissent_without_llm(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(
-        "asmr_dubber.asr_review._request_json",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("LLM should not run")),
-    )
-
-    sentences = review_transcriptions(
-        _transcriptions(
-            ("parakeet_nemo|model", "正しい文"),
-            ("faster_whisper|large-v2", "正しい文。"),
-            ("kotoba_whisper|kotoba-tech/kotoba-whisper-v2.2", "全く違う文"),
-        ),
-        _settings(),
-        tmp_path / "review.json",
-    )
-
-    assert [item.source_text for item in sentences] == ["正しい文"]
-
-
-def test_models_from_same_family_do_not_create_false_majority(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(
-        "asmr_dubber.asr_review._request_json",
-        lambda *_args, **_kwargs: json.dumps(
-            {
-                "results": [
-                    {
-                        "window_id": "w000001",
-                        "selected_candidate": 2,
-                        "confidence": 0.9,
-                    }
-                ]
-            }
-        ),
-    )
-
-    sentences = review_transcriptions(
-        _transcriptions(
-            ("parakeet_nemo|model", "独立した候補"),
-            ("faster_whisper|large-v2", "同じ系列の候補"),
-            ("kotoba_whisper|kotoba-tech/kotoba-whisper-v2.2", "同じ系列の候補。"),
-        ),
-        _settings(),
-        tmp_path / "review.json",
-    )
-
-    assert [item.source_text for item in sentences] == ["同じ系列の候補"]
-
-
-def test_llm_can_only_select_an_existing_candidate(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(
-        "asmr_dubber.asr_review._request_json",
-        lambda *_args, **_kwargs: json.dumps(
-            {
-                "results": [
-                    {
-                        "window_id": "w000001",
-                        "selected_candidate": 2,
-                        "confidence": 0.88,
-                    }
-                ]
-            }
-        ),
-    )
-    report = tmp_path / "review.json"
-
-    sentences = review_transcriptions(
-        _transcriptions(
-            ("faster_whisper|large-v2", "候補一"),
-            ("kotoba_whisper|kotoba-tech/kotoba-whisper-v2.2", "候補二"),
-        ),
-        _settings(),
+@pytest.mark.parametrize("mode", ["suggest", "conservative"])
+def test_negation_is_never_fuzzy_consensus_or_automatic_edit(tmp_path, mode):
+    baseline = [row("明日はこの場所に来てください。")]
+    other = [row("明日はこの場所に来ないでください。")]
+    report = tmp_path / "analysis/asr_review.json"
+    output = run_audio_review(
+        audio(tmp_path),
+        baseline,
+        settings(asr_review_mode=mode),
         report,
+        runner=fake_runner({"parakeet_nemo": other, "faster_whisper": other}),
     )
-
-    assert [item.source_text for item in sentences] == ["候補二"]
-    assert json.loads(report.read_text(encoding="utf-8"))["results"][0]["decision"] == "llm_choice"
-
-
-def test_low_confidence_llm_choice_falls_back_and_marks_sentence(
-    monkeypatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(
-        "asmr_dubber.asr_review._request_json",
-        lambda *_args, **_kwargs: json.dumps(
-            {
-                "results": [
-                    {
-                        "window_id": "w000001",
-                        "selected_candidate": 2,
-                        "confidence": 0.4,
-                    }
-                ]
-            }
-        ),
-    )
-    report = tmp_path / "review.json"
-
-    sentences = review_transcriptions(
-        _transcriptions(
-            ("faster_whisper|large-v2", "主模型文字"),
-            ("parakeet_nemo|model", "低置信候选"),
-        ),
-        _settings(),
-        report,
-    )
-
-    assert [item.source_text for item in sentences] == ["主模型文字"]
-    assert sentences[0].status == "review_uncertain"
+    assert output[0].source_text == baseline[0].source_text
     result = json.loads(report.read_text(encoding="utf-8"))["results"][0]
-    assert result["decision"] == "low_confidence_fallback"
-    assert result["needs_review"] is True
+    assert result["status"] == "disagreement"
+    assert result["candidates"][0]["protected_change"]
 
 
-def test_invalid_llm_selection_falls_back_to_primary(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(
-        "asmr_dubber.asr_review._request_json",
-        lambda *_args, **_kwargs: json.dumps(
-            {
-                "results": [
-                    {
-                        "window_id": "w000001",
-                        "selected_candidate": 99,
-                    }
-                ]
-            }
-        ),
-    )
-    report = tmp_path / "review.json"
-
-    sentences = review_transcriptions(
-        _transcriptions(
-            ("faster_whisper|large-v2", "主模型文字"),
-            ("kotoba_whisper|kotoba-tech/kotoba-whisper-v2.2", "其它文字"),
-        ),
-        _settings(),
-        report,
-    )
-
-    assert [item.source_text for item in sentences] == ["主模型文字"]
-    result = json.loads(report.read_text(encoding="utf-8"))["results"][0]
-    assert result["decision"] == "fallback"
-    assert "回退主模型" in result["reason"]
+def test_near_match_candidates_remain_distinct():
+    w = AudioWindow("w1", 0, 8, 0, 8, "end")
+    baseline = [row("明日はこの場所に来てください。")]
+    evidence = [
+        _candidate(baseline, w, "parakeet_nemo|m", "ja"),
+        _candidate([row("明日はこの場所に来ないでください。")], w, "faster_whisper|m", "ja"),
+    ]
+    assert len(compare_window(w, baseline, evidence, "parakeet_nemo|m", "ja")["candidates"]) == 2
 
 
-def test_llm_network_failure_does_not_abort_review(monkeypatch, tmp_path: Path) -> None:
-    def fail_request(*_args, **_kwargs):
-        raise httpx.ConnectError("offline")
-
-    monkeypatch.setattr("asmr_dubber.asr_review._request_json", fail_request)
-
-    sentences = review_transcriptions(
-        _transcriptions(
-            ("faster_whisper|large-v2", "主模型文字"),
-            ("kotoba_whisper|kotoba-tech/kotoba-whisper-v2.2", "其它文字"),
-        ),
-        _settings(),
+def test_conservative_requires_primary_relisten_and_independent_family(tmp_path):
+    baseline = [row("ここは綺麗な花が咲いています。")]
+    other = [row("ここは綺麗な桜が咲いています。")]
+    output = run_audio_review(
+        audio(tmp_path),
+        baseline,
+        settings(asr_review_mode="conservative"),
         tmp_path / "review.json",
+        runner=fake_runner({"parakeet_nemo": other, "faster_whisper": other}),
+    )
+    assert output[0].source_text == "ここは綺麗な桜が咲いています。"
+    assert output[0].review_locked
+    cfg = settings(asr_review_mode="conservative")
+    cfg.asr_backend = "faster_whisper"
+    cfg.asr_review_models = ["kotoba_whisper|kotoba-tech/kotoba-whisper-v2.2"]
+    output = run_audio_review(
+        tmp_path / "source.wav",
+        baseline,
+        cfg,
+        tmp_path / "other-review.json",
+        runner=fake_runner({"faster_whisper": other, "kotoba_whisper": other}),
+    )
+    assert output[0].source_text == baseline[0].source_text
+
+
+def test_window_plan_covers_silence_and_has_nonoverlapping_cores(tmp_path):
+    windows = plan_windows(audio(tmp_path, 95), 30, 0.5)
+    assert windows[0].start == 0 and windows[-1].end == 95
+    assert all(a.end == b.start for a, b in pairwise(windows))
+    assert all(w.audio_start <= w.start < w.end <= w.audio_end for w in windows)
+
+
+def test_cross_boundary_proposals_cannot_duplicate_or_drop_neighbors():
+    w = AudioWindow("w1", 0, 10, 0, 11, "forced")
+    baseline = [row("またね。", 8, 12)]
+    result = compare_window(
+        w,
+        baseline,
+        [_candidate([row("またね。", 8, 10)], w, "parakeet_nemo|m", "ja")],
+        "parakeet_nemo|m",
+        "ja",
+    )
+    assert result["status"] == "boundary_review"
+    with pytest.raises(ProjectError, match="边界"):
+        replace_window(baseline, result, result["candidates"][0], settings())
+
+
+def test_failure_and_retry_preserve_primary_and_reuse_successful_windows(tmp_path):
+    baseline = [row("主稿。")]
+    report = tmp_path / "analysis/asr_review.json"
+
+    def fail(jobs, cfg, *args):
+        for identifier, _ in jobs:
+            if cfg.asr_backend == "parakeet_nemo":
+                yield identifier, baseline, None
+            else:
+                yield identifier, None, "backend unavailable"
+
+    output = run_audio_review(audio(tmp_path), baseline, settings(), report, runner=fail)
+    assert output == baseline
+    assert json.loads(report.read_text(encoding="utf-8"))["state"] == "completed_with_warnings"
+    calls = []
+    run_audio_review(
+        tmp_path / "source.wav",
+        baseline,
+        settings(),
+        report,
+        runner=fake_runner({"parakeet_nemo": baseline, "faster_whisper": baseline}, calls),
+    )
+    assert [c[0] for c in calls] == ["faster_whisper"]
+
+
+def test_cancellation_checkpoints_completed_evidence(tmp_path):
+    baseline = [row("主稿。")]
+    report = tmp_path / "analysis/asr_review.json"
+    signal = threading.Event()
+
+    def cancel(jobs, *args):
+        for identifier, _ in jobs:
+            yield identifier, baseline, None
+        signal.set()
+
+    with pytest.raises(OperationCancelledError):
+        run_audio_review(
+            audio(tmp_path), baseline, settings(), report, runner=cancel, cancel_event=signal
+        )
+    assert json.loads(report.read_text(encoding="utf-8"))["state"] == "cancelled"
+    assert list((tmp_path / "analysis/review-v2-cache").glob("*.json"))
+
+
+def test_cache_invalidates_for_acoustic_settings(tmp_path):
+    source = audio(tmp_path)
+    baseline = [row("主稿。")]
+    report = tmp_path / "analysis/asr_review.json"
+    run = fake_runner({"parakeet_nemo": baseline, "faster_whisper": baseline})
+    run_audio_review(source, baseline, settings(), report, runner=run)
+    calls = []
+    run_audio_review(
+        source,
+        baseline,
+        settings(asr_beam_size=7),
+        report,
+        runner=fake_runner({"parakeet_nemo": baseline, "faster_whisper": baseline}, calls),
+    )
+    assert len(calls) == 2
+
+
+def test_apply_undo_and_stale_table_guard(tmp_path, monkeypatch):
+    source = audio(tmp_path)
+    baseline = [row("こんにちは。")]
+    p = DubProject(
+        source=AudioInfo(
+            path=source.name, sha256="a" * 64, duration_seconds=8, sample_rate=16000, channels=1
+        ),
+        settings=settings(),
+        sentences=baseline,
+    )
+    save_project(p, tmp_path)
+    report_path = tmp_path / "analysis/asr_review.json"
+    run_audio_review(
+        source,
+        baseline,
+        p.settings,
+        report_path,
+        runner=fake_runner({"parakeet_nemo": baseline, "faster_whisper": [row("こんばんは。")]}),
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    candidate = next(c for c in report["results"][0]["candidates"] if c["text"] == "こんばんは。")
+    monkeypatch.setattr("asmr_dubber.review_services.view", lambda p, *a: p)
+    accepted = apply_review(str(tmp_path), "w000001", candidate["id"])
+    assert (
+        accepted.sentences[0].source_text == "こんばんは。" and accepted.sentences[0].review_locked
+    )
+    restored = undo_review(str(tmp_path))
+    assert restored.sentences[0].source_text == "こんにちは。"
+    restored.sentences[0].source_text = "人工修改。"
+    save_project(restored, tmp_path)
+    with pytest.raises(ProjectError, match="主稿已改变"):
+        apply_review(str(tmp_path), "w000001", candidate["id"])
+
+
+def test_numbers_signs_and_decimals_are_not_collapsed():
+    assert normalize_text("1.5") != normalize_text("15")
+    assert normalize_text("-3") != normalize_text("3")
+    assert normalize_text("can't") != normalize_text("cant")
+
+
+def test_recognition_session_reuses_and_releases_model(monkeypatch):
+    from asmr_dubber.asr import _session_model, recognition_session
+
+    created = []
+    monkeypatch.setattr("asmr_dubber.asr._cleanup_cuda", lambda: None)
+
+    def factory():
+        obj = object()
+        created.append(obj)
+        return obj
+
+    with recognition_session():
+        assert _session_model("test", factory) is _session_model("test", factory)
+    with recognition_session():
+        _session_model("test", factory)
+    assert len(created) == 2
+
+
+def test_primary_is_persisted_before_review_failure(tmp_path, monkeypatch):
+    from asmr_dubber import pipeline
+
+    source = audio(tmp_path)
+    cfg = settings()
+    cfg.asr_model = "grider-transwithai/parakeet-ctc-1.1b-ja::parakeet-ja-gal.nemo"
+    p = DubProject(
+        source=AudioInfo(
+            path=source.name, sha256="a" * 64, duration_seconds=8, sample_rate=16000, channels=1
+        ),
+        settings=cfg,
+    )
+    monkeypatch.setattr(pipeline, "verify_source", lambda *args: source)
+    monkeypatch.setattr(
+        pipeline, "transcribe_source", lambda *args, **kwargs: ([row("主稿已完成。")], "ja")
     )
 
-    assert [item.source_text for item in sentences] == ["主模型文字"]
+    def fail(audio, baseline, settings, path, **kwargs):
+        saved, _ = load_project(tmp_path)
+        assert saved.sentences[0].source_text == "主稿已完成。"
+        raise OperationCancelledError("cancelled")
+
+    monkeypatch.setattr(pipeline, "run_audio_review", fail)
+    with pytest.raises(OperationCancelledError):
+        pipeline._analyze_project_impl(p, tmp_path)
+    assert load_project(tmp_path)[0].sentences[0].source_text == "主稿已完成。"
 
 
-def test_one_invalid_window_falls_back_without_losing_other_llm_choice(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    primary = [
-        _sentence("p1", 1.0, 2.0, "主一"),
-        _sentence("p2", 3.0, 4.0, "主二"),
-    ]
-    secondary = [
-        _sentence("s1", 1.0, 2.0, "复核一"),
-        _sentence("s2", 3.0, 4.0, "复核二"),
-    ]
-
-    def response(_settings, messages, _job_id):
-        target_message = messages[-1]["content"]
-        if '"target_window_ids":["w000001","w000002"]' in target_message:
-            return '{"results":[]}'
-        if '"target_window_ids":["w000001"]' in target_message:
-            return json.dumps(
-                {
-                    "results": [
-                        {
-                            "window_id": "w000001",
-                            "selected_candidate": 2,
-                            "confidence": 0.9,
-                        }
-                    ]
-                }
-            )
-        return json.dumps(
-            {
-                "results": [
-                    {
-                        "window_id": "w000002",
-                        "selected_candidate": 99,
-                    }
-                ]
-            }
+def test_new_row_inside_window_prevents_old_proposal_application():
+    baseline = [row("原稿。")]
+    w = AudioWindow("w1", 0, 8, 0, 8, "end")
+    result = compare_window(
+        w,
+        baseline,
+        [_candidate([row("候補。")], w, "faster_whisper|m", "ja")],
+        "parakeet_nemo|m",
+        "ja",
+    )
+    with pytest.raises(ProjectError, match="新增"):
+        replace_window(
+            [*baseline, row("新增。", 5, 6, "s2")], result, result["candidates"][0], settings()
         )
 
-    monkeypatch.setattr("asmr_dubber.asr_review._request_json", response)
-    report = tmp_path / "review.json"
 
-    sentences = review_transcriptions(
-        [
-            ("faster_whisper|large-v2", primary),
-            ("kotoba_whisper|kotoba-tech/kotoba-whisper-v2.2", secondary),
-        ],
-        _settings(),
-        report,
+def test_main_model_omission_is_visible_without_automatic_insert(tmp_path):
+    baseline = []
+    path = tmp_path / "review.json"
+    output = run_audio_review(
+        audio(tmp_path),
+        baseline,
+        settings(asr_review_mode="conservative"),
+        path,
+        runner=fake_runner(
+            {"parakeet_nemo": [row("聞こえる。")], "faster_whisper": [row("聞こえる。")]}
+        ),
+    )
+    result = json.loads(path.read_text(encoding="utf-8"))["results"][0]
+    assert output == [] and result["status"] == "disagreement"
+    assert result["candidates"] and result["action"] == "keep_baseline"
+
+
+def test_large_rewrite_is_never_auto_applied(tmp_path):
+    baseline = [row("今日はここに来ました。")]
+    other = [row("それでは明日の予定を説明しましょう。")]
+    result = run_audio_review(
+        audio(tmp_path),
+        baseline,
+        settings(asr_review_mode="conservative"),
+        tmp_path / "review.json",
+        runner=fake_runner({"parakeet_nemo": other, "faster_whisper": other}),
+    )
+    assert result == baseline
+
+
+def test_empty_review_window_is_valid_not_a_backend_failure(monkeypatch):
+    from asmr_dubber.asr import _finish_tokens, recognition_session
+
+    monkeypatch.setattr("asmr_dubber.asr._cleanup_cuda", lambda: None)
+    with recognition_session():
+        assert _finish_tokens([], "", "ja", settings()) == ([], "ja")
+
+
+def test_english_word_boundaries_are_meaningful():
+    assert normalize_text("now here") != normalize_text("nowhere")
+    assert normalize_text("Today is cold. We should go.") == normalize_text(
+        "Today is cold We should go"
     )
 
-    assert [item.source_text for item in sentences] == ["复核一", "主二"]
-    decisions = [
-        item["decision"] for item in json.loads(report.read_text(encoding="utf-8"))["results"]
+
+def test_alignment_preserves_ids_text_and_rejects_large_drift(tmp_path, monkeypatch):
+    from asmr_dubber.audio import probe_audio
+    from asmr_dubber.review_services import align_review
+    from asmr_dubber.ui_services import project_rows
+
+    source = audio(tmp_path)
+    info = probe_audio(source)
+    info.path = source.name
+    p = DubProject(
+        source=info, settings=settings(), sentences=[row("第一句。"), row("第二句。", 4, 5, "s2")]
+    )
+    save_project(p, tmp_path)
+
+    def align(audio, rows, *args, **kwargs):
+        rows[0].start_seconds = 6
+        rows[0].end_seconds = 7
+        rows[1].start_seconds = 4.1
+        for i, r in enumerate(rows):
+            r.id = f"renamed{i}"
+        return []
+
+    monkeypatch.setattr("asmr_dubber.forced_alignment.align_sentences_with_qwen", align)
+    monkeypatch.setattr("asmr_dubber.review_services.view", lambda p, *args: p)
+    monkeypatch.setattr("asmr_dubber.review_services.portable_home", lambda: tmp_path)
+    result = align_review(str(tmp_path), project_rows(p))
+    assert [(r.id, r.source_text) for r in result.sentences] == [
+        ("s1", "第一句。"),
+        ("s2", "第二句。"),
     ]
-    assert decisions == ["llm_choice", "fallback"]
+    assert result.sentences[0].start_seconds == 1
+    assert result.sentences[1].start_seconds == 4.1

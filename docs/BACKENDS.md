@@ -1,6 +1,6 @@
 # 后端指南
 
-ASR（语音识别）接入 Parakeet、Kotoba-Whisper、Faster-Whisper，以及兼容 OpenAI `/v1/audio/transcriptions` 的通用 ASR API。TTS（语音合成）可使用本地 IndexTTS2、IndexTTS2 API、通用 OpenAI `/v1/audio/speech` API、Edge 在线语音，以及 MiMo、MiniMax、GPT-SoVITS、CosyVoice 和 Fish Speech/Fish Audio API。
+ASR（语音识别）接入 Parakeet、Kotoba-Whisper、Faster-Whisper，以及兼容 OpenAI `/v1/audio/transcriptions` 的通用 ASR API。TTS（语音合成）可使用本地 IndexTTS2、IndexTTS-2.5、IndexTTS2 API、通用 OpenAI `/v1/audio/speech` API、Edge 在线语音，以及 MiMo、MiniMax、GPT-SoVITS、CosyVoice 和 Fish Speech/Fish Audio API。
 
 程序启动时会检查 IndexTTS2 是否完整；未安装时，新项目默认使用 Edge TTS。项目开始执行后不会再静默切换后端。
 
@@ -21,7 +21,8 @@ Kotoba-Whisper 约 3 GB 显存、Faster-Whisper 约 2 GB 显存可能装入较�
 
 | 后端 | 运行位置 | 参考文字 | API Key |
 |---|---|---|---|
-| IndexTTS2 | 本机 NVIDIA CUDA | 不需要 | 不需要 |
+| IndexTTS2 | 本机 CPU、NVIDIA CUDA | 不需要 | 不需要 |
+| IndexTTS-2.5 | 本机 CPU、NVIDIA CUDA | 不需要 | 不需要 |
 | Edge TTS | Microsoft 在线服务 | 不使用参考音频 | 不需要 |
 | MiMo TTS | 小米 MiMo 云服务 | 音色克隆不需要 | 需要 |
 | MiniMax TTS | MiniMax 云服务 | 不使用参考音频 | 需要 |
@@ -31,7 +32,7 @@ Kotoba-Whisper 约 3 GB 显存、Faster-Whisper 约 2 GB 显存可能装入较�
 | IndexTTS2 API | 用户管理的本机、容器或云端服务 | 不需要 | 取决于服务端 |
 | 通用 TTS API | 兼容 OpenAI `/v1/audio/speech` 的服务 | 不使用 | 取决于服务端 |
 
-IndexTTS2 约 6 GB 显存起，10 GB 以上更合适。Edge、MiMo 和 MiniMax 由在线服务完成合成；GPT-SoVITS、CosyVoice 和 Fish Speech 的服务端由用户自行管理。
+IndexTTS2 约 6 GB 显存起，10 GB 以上更合适。IndexTTS-2.5 的运行环境和权重更大，建议使用支持 BF16 且有 10 GB 以上显存的 NVIDIA 显卡；CPU 可以运行，但不适合长项目。Edge、MiMo 和 MiniMax 由在线服务完成合成；GPT-SoVITS、CosyVoice 和 Fish Speech 的服务端由用户自行管理。
 
 ## 安装方案中的固定模型
 
@@ -103,7 +104,7 @@ $env:HF_ENDPOINT = "https://hf-mirror.com"
 & ".\.asmr-dubber\venv\Scripts\python.exe" -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Systran/faster-whisper-large-v3', local_dir=r'.asmr-dubber\models\faster-whisper-large-v3')"
 ```
 
-随后在 ASR 设置中选择 Faster-Whisper，并把模型填写为 `.asmr-dubber\models\faster-whisper-large-v3`。NVIDIA GPU 通常使用 `float16`，显存紧张时使用 `int8_float16`；CPU 使用 `int8`。已经打开项目时，“保存设置”会同时更新当前项目。
+随后在 ASR 设置中选择 Faster-Whisper，填写完整模型路径，按设备选择精度。要更新当前项目，保存范围须选“仅当前项目”或“两者”。手动 SDK 下载是用户自行获取模型的操作，不受安装器来源筛选代管。
 
 ## VAD、识别和时间戳如何组合
 
@@ -125,24 +126,17 @@ Parakeet/CrispASR 和 Faster-Whisper 可以使用各自的 Silero VAD。它跟�
 
 `Qwen/Qwen3-ForcedAligner-0.6B` 接收任一支持识别器得到的日语或英语，只重算句子起止边界。它不是识别后端，也不参与修改文字。英语项目同样可以使用它，不需要额外的英文模型。
 
-单模型识别可以直接启用；多模型校对也可以把它选为最终时间戳来源。单句对齐失败时保留 ASR 原边界，并把原因写进 `analysis/asr_forced_alignment.json` 或 `analysis/asr_review.json`。
+单模型识别可以启用；新版复核在确认文字后独立对齐时间。记录见 `analysis/asr_forced_alignment.json` 或 `analysis/review_alignment.json`。对齐成功不证明文字正确。
 
-## 多模型交叉校对
+## 多模型音频片段复核
 
-多模型模式让已安装的 Parakeet、Kotoba-Whisper 和 Faster-Whisper 依次识别。程序先合并过短的异常分段，再用全文字符对齐把其它模型的长短句投影到共同的比较窗口。文字近似一致时直接采用；仍有争议时，LLM 只能从窗口内的现有候选中选择。
+**实验性，效果可能不如单模型。** 当前实现先保存单模型原稿，再以统一音频片段复听；不再使用全文字符插值、模糊合并或 LLM 裁决。分句不同不等于文字冲突，一致性不等于正确率。
 
-Parakeet 变体按 Parakeet 家族计票，Kotoba-Whisper 与 Faster-Whisper 按 Whisper 家族计票，避免同架构模型重复计票。LLM 置信度低于程序门槛时不会覆盖程序裁决，该句会在项目诊断中标记为需要核对。
+默认“仅提出建议”。保守自动模式只允许满足检查条件的小范围变化；数字、否定、人工锁定和不安全边界等情况保留人工确认。模型按家族去重，不把 Kotoba 与 Faster-Whisper 的相同意见视为两个独立家族。
 
-界面只列出本地模型和运行依赖都完整的组合。文字优先来源必须是已安装识别器；最终时间戳可来自某个候选，也可由 Qwen3 ForcedAligner 重算。程序不接受 LLM 自行编造文字或时间。
+工作台结果面板提供原音频试听、候选差异、采纳、确认、撤销和只重试复核。时间对齐是文字确认后的独立操作，不作为文字正确性的证据。详见[图文教程](AUDIO_REVIEW_TUTORIAL.md)。
 
-审计文件：
-
-```text
-analysis/asr_candidates.json
-analysis/asr_review.json
-```
-
-DeepSeek、阿里云百炼、豆包、商汤 SenseNova、OpenAI、Anthropic Claude、Google Gemini 和 OpenAI-compatible LLM 可以校对。DeepL、Google Cloud Translation 和 Microsoft Azure Translator 只能翻译，不能做这一步。
+报告为 `analysis/asr_review.json`（schema 2）；原稿为 `analysis/asr-baseline-r*.json`，历史报告和成功窗口分别在 `analysis/review-history`、`analysis/review-v2-cache`。旧版报告需重新复核，不能按旧状态名称解释新结果。
 
 ## IndexTTS2
 
@@ -166,6 +160,24 @@ bash scripts/linux/install-indextts2.sh
 统一音色参考更适合单角色长项目。逐句参考会跟随场景变化，但短句、气声、音效和背景音乐也更容易造成音色漂移。推荐选 5–15 秒、单一说话人、清晰且包含实义语音的参考。
 
 IndexTTS2 使用独立的 bilibili Model Use License，不属于本项目 MIT License。安装和使用前请阅读上游条款。
+
+## IndexTTS-2.5
+
+IndexTTS-2.5 使用单独的 `.asmr-dubber/runtimes/index-tts-2.5` 运行环境。它不随基础、推荐或进阶方案安装；旧 IndexTTS2 仍是推荐方案和新项目的默认本地 TTS。需要 2.5 时，在“设置 → 设备与模型”选择它并点击安装，完成后再到 TTS（语音合成）设置中切换后端。
+
+模型使用项目维护、固定 SHA-256 的 ModelScope 模型包；失败时保留断点，不回退到未固定版本的 SDK snapshot。依赖优先使用离线 wheelhouse。源码回退仍受海外下载开关约束。首次安装需要约 11 GB 模型权重和约 4 GB 平台依赖包，解压与建环境还需要额外空间。修复失败会恢复原源码和环境；成功后旧环境备份保留在 runtimes 下，确认新环境可用后可手动归档或清理。
+
+2.5 沿用项目统一音色参考、逐句参考和外部参考音频，并增加以下能力：
+
+- 合成中文、英语、日语、西班牙语或阿拉伯语；中文配音保持“中文”即可；
+- 音色与情绪使用不同音频，也可用文字描述或快乐、愤怒、悲伤、害怕、厌恶、低落、惊讶、平静八维向量控制情绪；
+- 用时长倍率调整模型原始输出时长，之后仍由项目混音时间窗处理冲突；
+- 调整文本切段、采样、束搜索、重复惩罚和最大声学 Token；
+- 可选 BF16、BigVGAN CUDA 内核、DeepSpeed、GPT 加速和 `torch.compile`。
+
+默认只开启 BF16、文本规范化与采样，其它加速项保持关闭。BigVGAN CUDA 内核和 `torch.compile` 可能需要本机 CUDA 编译环境，DeepSpeed 与 GPT 加速也受平台和依赖版本限制；安装器不会因为勾选这些选项而临时修改环境，缺少依赖时会明确报错。首次合成需要加载多个模型，文字情绪还会加载额外情绪模型，因此开始占用 GPU 前可能等待较久。
+
+`duration_factor` 表示时长倍率：小于 1 会缩短生成音频，大于 1 会拉长。上游当前公开实现支持 0.5–2.0，但它不是严格指定最终秒数；成品落点和句间冲突仍以 ASMR Dubber 的混音设置为准。
 
 ## IndexTTS2 API
 
@@ -282,7 +294,7 @@ LLM 服务使用有界滑动上下文和翻译记忆，并要求每个输入句�
 
 | 服务 | 典型用途 |
 |---|---|
-| DeepSeek、阿里云百炼、豆包、商汤 SenseNova、OpenAI、Claude、Gemini | 上下文翻译、台本校对和多 ASR 校对 |
+| DeepSeek、阿里云百炼、豆包、商汤 SenseNova、OpenAI、Claude、Gemini | 翻译、已有台本的 LLM 校对；新版本地音频复核不依赖 LLM |
 | OpenAI-compatible | Ollama、LM Studio、vLLM 或自建兼容接口 |
 | DeepL | 专业机器翻译 API |
 | Google Cloud Translation | Basic v2 逐句翻译 |

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "release": "1.3.1",
+  "release": "1.4.0",
   "repository": "EveningStudyW/ASMR-Dubber-Portable-Mirror",
   "revision": "master",
   "artifacts": [
@@ -107,5 +107,8 @@
       "sha256": "7dc3b4384c02aecb87eb8b70fa26c5843a08af242f4638aa4b36922bdc4f5b04"
     }
   ],
-  "sidecar_verified_archives": []
+  "sidecar_verified_archives": [
+    "ASMR-Dubber-IndexTTS25-Wheelhouse-v1.0.0.zip",
+    "ASMR-Dubber-IndexTTS25-Wheelhouse-v1.0.0.tar.gz"
+  ]
 }

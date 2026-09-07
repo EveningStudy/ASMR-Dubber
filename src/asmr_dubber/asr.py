@@ -12,6 +12,8 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,7 @@ from .environment import (
     resolve_transformers_model_source,
 )
 from .errors import AsmrDubberError
+from .filtering import has_speakable_text
 from .languages import SpeechSourceLanguage, source_language_label
 from .models import ProjectSettings, Sentence
 from .platforms import current_platform, isolated_runtime_environment, portable_home
@@ -55,6 +58,29 @@ _PARAKEET_BOUNDARY_SEARCH_SECONDS = 5.0
 _PARAKEET_BOUNDARY_WINDOW_SECONDS = 0.1
 _TRANSFORMERS_ASR_PIPELINE_LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
+_REVIEW_MODELS: ContextVar[dict[str, Any] | None] = ContextVar("review_asr_models", default=None)
+
+
+@contextmanager
+def recognition_session():
+    """Keep one selected Python ASR model resident across equal-audio windows."""
+    models: dict[str, Any] = {}
+    marker = _REVIEW_MODELS.set(models)
+    try:
+        yield
+    finally:
+        models.clear()
+        _REVIEW_MODELS.reset(marker)
+        _cleanup_cuda()
+
+
+def _session_model(key: str, factory: Callable[[], Any]) -> Any:
+    models = _REVIEW_MODELS.get()
+    if models is None:
+        return factory()
+    if key not in models:
+        models[key] = factory()
+    return models[key]
 
 
 def _run_transformers_asr_pipeline(pipe: Any, inputs: Any, **kwargs: Any) -> Any:
@@ -146,6 +172,8 @@ def _finish_tokens(
 ) -> tuple[list[Sentence], str]:
     values = list(tokens)
     if not values:
+        if _REVIEW_MODELS.get() is not None and not full_text.strip():
+            return [], language or source_language
         raise AsmrDubberError("识别出了文字，但所选 ASR（语音识别）后端没有返回可用时间戳。")
     punctuated = restore_punctuation(values, full_text)
     sentences = split_timed_tokens(
@@ -161,6 +189,8 @@ def _finish_tokens(
 
 
 def _cleanup_cuda() -> None:
+    if _REVIEW_MODELS.get() is not None:
+        return
     gc.collect()
     try:
         import torch
@@ -307,10 +337,13 @@ def _transcribe_faster_whisper(
             )
             if progress:
                 progress("Faster-Whisper CPU 自动使用 int8 计算精度", 0, 1)
-        model = WhisperModel(
-            model_source,
-            device=settings.asr_device,
-            compute_type=compute_type,
+        model = _session_model(
+            f"whisper:{model_source}:{settings.asr_device}:{compute_type}",
+            lambda: WhisperModel(
+                model_source,
+                device=settings.asr_device,
+                compute_type=compute_type,
+            ),
         )
         transcribe_kwargs = {
             "language": source_language,
@@ -350,6 +383,14 @@ def _transcribe_faster_whisper(
         for segment in segments:
             check_cancelled(cancel_event)
             values.append(segment)
+            if progress:
+                duration = float(getattr(info, "duration", 0) or 0)
+                consumed = min(duration, max(0.0, float(getattr(segment, "end", 0) or 0)))
+                progress(
+                    f"Faster-Whisper 已识别 {consumed:.1f}/{duration:.1f} 秒",
+                    round(consumed * 1000),
+                    max(1, round(duration * 1000)),
+                )
         tokens: list[TimedToken] = []
         for segment in values:
             words = list(getattr(segment, "words", None) or [])
@@ -413,23 +454,32 @@ def _transcribe_kotoba_whisper(
     try:
         source, revision = resolve_transformers_model_source(settings.asr_model)
         dtype = torch.float16 if use_cuda else torch.float32
-        processor = AutoProcessor.from_pretrained(source, revision=revision)
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            source,
-            revision=revision,
-            dtype=dtype,
-            low_cpu_mem_usage=True,
-        ).to(settings.asr_device if use_cuda else "cpu")
-        pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            dtype=dtype,
-            device=settings.asr_device if use_cuda else "cpu",
-            chunk_length_s=settings.asr_kotoba_chunk_seconds,
-            batch_size=max(1, settings.asr_batch_size),
-            ignore_warning=True,
+        processor = _session_model(
+            f"processor:{source}:{revision}",
+            lambda: AutoProcessor.from_pretrained(source, revision=revision),
+        )
+        model = _session_model(
+            f"kotoba:{source}:{revision}:{settings.asr_device}",
+            lambda: AutoModelForSpeechSeq2Seq.from_pretrained(
+                source,
+                revision=revision,
+                dtype=dtype,
+                low_cpu_mem_usage=True,
+            ).to(settings.asr_device if use_cuda else "cpu"),
+        )
+        pipe = _session_model(
+            f"pipeline:{source}:{revision}:{settings.asr_device}",
+            lambda model=model, processor=processor: pipeline(
+                "automatic-speech-recognition",
+                model=model,
+                tokenizer=processor.tokenizer,
+                feature_extractor=processor.feature_extractor,
+                dtype=dtype,
+                device=settings.asr_device if use_cuda else "cpu",
+                chunk_length_s=settings.asr_kotoba_chunk_seconds,
+                batch_size=max(1, settings.asr_batch_size),
+                ignore_warning=True,
+            ),
         )
         sample_rate, chunk_ranges = _audio_file_chunk_ranges(
             analysis_audio,
@@ -506,7 +556,7 @@ def _parakeet_model_path(model_id: str) -> Path:
 
 
 def _parakeet_input_path(analysis_audio: Path, run_directory: Path) -> Path:
-    """Give CrispASR an ASCII path on Windows without changing the analysis copy."""
+    """Stage a non-ASCII Windows source inside the portable ASR run directory."""
     resolved = analysis_audio.resolve()
     if not current_platform().is_windows or str(resolved).isascii():
         return resolved
@@ -596,6 +646,9 @@ def _transcribe_parakeet(
     cancel_event: CancellationSignal | None = None,
     *,
     source_language: SpeechSourceLanguage = "ja",
+    window_inputs: list[Path] | None = None,
+    window_results: dict[str, list[Sentence]] | None = None,
+    window_errors: dict[str, str] | None = None,
 ) -> tuple[list[Sentence], str]:
     check_cancelled(cancel_event)
     if source_language != "ja":
@@ -606,19 +659,34 @@ def _transcribe_parakeet(
         raise AsmrDubberError(
             "Parakeet/CrispASR 未安装完整；请在“设备与模型”页选择 Parakeet 后点击安装。"
         )
-    run_directory = portable_home() / "temp" / "asr" / f"parakeet-{uuid.uuid4().hex}"
+    portable_root = portable_home().resolve()
+    run_directory = portable_root / "temp" / "asr" / f"parakeet-{uuid.uuid4().hex}"
     run_directory.mkdir(parents=True, exist_ok=False)
-    cache_directory = portable_home() / "cache" / "crispasr"
+    cache_directory = portable_root / "cache" / "crispasr"
     cache_directory.mkdir(parents=True, exist_ok=True)
     native_input = _parakeet_input_path(analysis_audio, run_directory)
+    use_portable_relative_paths = current_platform().is_windows and not str(portable_root).isascii()
+    command_directory = portable_root if use_portable_relative_paths else PROJECT_ROOT
+
+    def command_path(path: Path) -> str:
+        resolved = path.resolve()
+        if not use_portable_relative_paths:
+            return str(resolved)
+        try:
+            relative = resolved.relative_to(portable_root)
+        except ValueError:
+            return str(resolved)
+        rendered = str(relative)
+        return rendered if rendered.isascii() else str(resolved)
+
     base_command = [
         str(executable),
         "--backend",
         "parakeet",
         "--cache-dir",
-        str(cache_directory),
+        command_path(cache_directory),
         "-m",
-        str(model_path),
+        command_path(model_path),
         "-l",
         "ja",
         "-ojf",
@@ -643,7 +711,7 @@ def _transcribe_parakeet(
     if not settings.asr_device.startswith("cuda"):
         base_command.append("--no-gpu")
     environment = isolated_runtime_environment("crispasr")
-    environment["CRISPASR_CACHE_DIR"] = str(portable_home() / "cache" / "crispasr")
+    environment["CRISPASR_CACHE_DIR"] = command_path(cache_directory)
     # FastConformer attention still grows with the input duration in CrispASR
     # 0.8.x. Supplying a multi-hour file directly can therefore request tens of
     # GiB even when --chunk-seconds is present. CrispASR accepts several input
@@ -658,6 +726,18 @@ def _transcribe_parakeet(
         chunk_seconds: float,
         attempt: int,
     ) -> tuple[int, list[tuple[Path, int, int]]]:
+        if window_inputs is not None:
+            chunk_directory = run_directory / f"chunks-{attempt:02d}"
+            chunk_directory.mkdir(parents=True, exist_ok=False)
+            window_chunks = []
+            sample_rate = 16000
+            for index, path in enumerate(window_inputs, start=1):
+                check_cancelled(cancel_event)
+                chunk_file = chunk_directory / f"chunk-{index:06d}.wav"
+                data, sample_rate = sf.read(path, dtype="float32")
+                sf.write(chunk_file, data, sample_rate, subtype="PCM_16")
+                window_chunks.append((chunk_file, 0, len(data)))
+            return sample_rate, window_chunks
         sample_rate, ranges = _audio_file_chunk_ranges(native_input, chunk_seconds)
         chunk_directory = run_directory / f"chunks-{attempt:02d}"
         chunk_directory.mkdir(parents=True, exist_ok=False)
@@ -686,7 +766,7 @@ def _transcribe_parakeet(
         current: list[Path] = []
         current_length = base_length
         for chunk_file in chunk_files:
-            argument_length = len(str(chunk_file)) + 3
+            argument_length = len(command_path(chunk_file)) + 3
             if current and current_length + argument_length > limit:
                 batches.append(current)
                 current = []
@@ -708,7 +788,8 @@ def _transcribe_parakeet(
         output_lines: list[str] = []
         process = subprocess.Popen(
             command,
-            cwd=PROJECT_ROOT,
+            start_new_session=os.name != "nt",
+            cwd=command_directory,
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -850,7 +931,7 @@ def _transcribe_parakeet(
             failed: tuple[int, str] | None = None
             for batch_index, batch in enumerate(batches, start=1):
                 check_cancelled(cancel_event)
-                command = [*base_command, *(str(path) for path in batch)]
+                command = [*base_command, *(command_path(path) for path in batch)]
                 return_code, output_lines, reported_completed = run_batch(
                     command,
                     batch_index=batch_index,
@@ -895,12 +976,14 @@ def _transcribe_parakeet(
             all_tokens: list[TimedToken] = []
             full_text_parts: list[str] = []
             language = "ja"
-            for chunk_file, start_sample, _end_sample in chunks:
+            for window_index, (chunk_file, start_sample, _end_sample) in enumerate(chunks):
                 check_cancelled(cancel_event)
                 result_file = chunk_file.with_suffix(".json")
                 if not result_file.is_file():
                     # CrispASR may return success without JSON for a fully silent
                     # input. Treat it as an empty chunk rather than a failure.
+                    if window_results is not None and window_inputs is not None:
+                        window_results[window_inputs[window_index].stem] = []
                     continue
                 try:
                     payload = json.loads(result_file.read_text(encoding="utf-8"))
@@ -911,6 +994,21 @@ def _transcribe_parakeet(
                 if not isinstance(payload, Mapping):
                     raise AsmrDubberError(f"Parakeet JSON 顶层格式无效：{result_file.name}")
                 tokens, full_text, chunk_language = _crispasr_payload_tokens(payload)
+                if window_results is not None and window_inputs is not None:
+                    identifier = window_inputs[window_index].stem
+                    try:
+                        window_results[identifier] = (
+                            _finish_tokens(
+                                tokens, full_text, chunk_language, settings, source_language
+                            )[0]
+                            if has_speakable_text(full_text)
+                            else []
+                        )
+                    except AsmrDubberError as exc:
+                        if window_errors is None:
+                            raise
+                        window_errors[identifier] = str(exc)
+                    continue
                 offset_seconds = start_sample / sample_rate
                 all_tokens.extend(
                     TimedToken(
@@ -923,6 +1021,8 @@ def _transcribe_parakeet(
                 full_text_parts.append(full_text)
                 if chunk_language:
                     language = chunk_language
+            if window_results is not None:
+                return [], language
             return _finish_tokens(
                 all_tokens,
                 "".join(full_text_parts),

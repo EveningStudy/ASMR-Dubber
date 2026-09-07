@@ -194,6 +194,39 @@ ASR_BACKENDS: dict[str, ModelBackend] = {
 
 
 TTS_BACKENDS: dict[str, ModelBackend] = {
+    "indextts2_5": ModelBackend(
+        id="indextts2_5",
+        label="IndexTTS-2.5 本地音色克隆",
+        kind="tts",
+        runtime="command",
+        default_model="IndexTTS-2.5",
+        models=("IndexTTS-2.5",),
+        help=(
+            "多语言零样本音色克隆，支持独立情绪参考、文字情绪、八维情绪向量、"
+            "时长控制和发音标注。程序逐句复用已加载模型与参考条件。"
+        ),
+        setup=(
+            "在“设备与模型”页安装。运行环境和模型与旧 IndexTTS2 完全隔离；"
+            "使用固定 SHA-256 的 ModelScope 模型包；失败时保留断点供重试。"
+        ),
+        reference_audio=True,
+        reference_text="unused",
+        style_reference=True,
+        tested_default=False,
+        support_level="verified",
+        devices=("cpu", "cuda"),
+        minimum_vram_gb=6,
+        recommended_vram_gb=10,
+        disk_gb=20,
+        installer="isolated",
+        homepage="https://github.com/index-tts/index-tts",
+        execution=ExecutionCapabilities(
+            batch_strategy="native_list",
+            reusable_reference_conditioning=True,
+            progress_strategy="streamed_process",
+            persistent_session=True,
+        ),
+    ),
     "indextts2": ModelBackend(
         id="indextts2",
         label="IndexTTS2 本地音色克隆（推荐）",
@@ -216,7 +249,7 @@ TTS_BACKENDS: dict[str, ModelBackend] = {
         style_reference=True,
         tested_default=True,
         support_level="verified",
-        devices=("cuda",),
+        devices=("cpu", "cuda"),
         minimum_vram_gb=6,
         recommended_vram_gb=10,
         disk_gb=20,

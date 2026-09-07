@@ -8,7 +8,13 @@ permissions:
   contents: write
 
 jobs:
+  verified:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   windows-launcher:
+    needs: verified
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -86,6 +92,11 @@ jobs:
           & $smokePython -c "import asmr_dubber.ui, edge_tts, gradio, httpx, setuptools"
           if ($LASTEXITCODE -ne 0) {
             throw "Bundled Windows core wheelhouse failed its runtime import smoke test."
+          }
+          & $smokePython scripts/export-dependency-inventory.py $coreWheelhouse `
+            (Join-Path $staging "DEPENDENCIES.json")
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inventory bundled dependency wheels."
           }
           Compress-Archive -Path $staging `
             -DestinationPath $archiveName

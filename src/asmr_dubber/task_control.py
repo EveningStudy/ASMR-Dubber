@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import threading
 from collections.abc import Callable, Iterator
@@ -24,11 +25,20 @@ def terminate_process_tree(process: subprocess.Popen[Any]) -> None:
             check=False,
         )
     else:
-        process.terminate()
+        try:
+            if os.getpgid(process.pid) == process.pid:
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            return
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        process.kill()
+        if os.name != "nt" and os.getpgid(process.pid) == process.pid:
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
         process.wait(timeout=5)
 
 

@@ -5,6 +5,7 @@ import os
 import shutil
 import threading
 import time
+import uuid
 from collections import Counter
 from contextlib import suppress
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from . import pipeline
 from .audio import extract_reference, verify_source
 from .errors import ProjectError
 from .languages import SourceLanguage, SpeechSourceLanguage, source_language_label
+from .lifecycle import invalidate_outputs
 from .model_registry import TTS_BACKENDS
 from .models import (
     DubProject,
@@ -49,6 +51,8 @@ _ASR_AFFECTING_SETTINGS = frozenset(
 
 _EDGE_TTS_PREVIEW_TEXT = "你好，欢迎使用 ASMR Dubber。"
 _EDGE_TTS_PREVIEW_LOCK = threading.Lock()
+_UI_CLEANUP_LOCK = threading.Lock()
+_UI_CLEANUP_TIMES: dict[Path, float] = {}
 
 
 @dataclass(frozen=True)
@@ -63,6 +67,7 @@ class ProjectView:
     subtitle_video: str | None
     diagnostics: str
     status: str
+    revision: int = 0
 
 
 def _table_values(table: Any) -> list[list[Any]]:
@@ -165,6 +170,7 @@ def apply_table(project: DubProject, table: Any) -> bool:
         )
         updated = old.model_copy(update=payload)
         if material_changed:
+            updated.review_locked = True
             updated.tts_file = None
             updated.tts_cache_key = None
             updated.tts_duration_seconds = None
@@ -200,11 +206,25 @@ def ui_stage_directory() -> Path:
 
     destination = portable_home() / "temp" / "ui"
     destination.mkdir(parents=True, exist_ok=True)
+    with _UI_CLEANUP_LOCK:
+        now = time.monotonic()
+        if now - _UI_CLEANUP_TIMES.get(destination, -float("inf")) < 300:
+            return destination
+        if len(_UI_CLEANUP_TIMES) >= 32:
+            _UI_CLEANUP_TIMES.clear()
+        _UI_CLEANUP_TIMES[destination] = now
     cutoff = time.time() - 24 * 3600
     for candidate in destination.rglob("*"):
         try:
-            if candidate.is_file() and candidate.stat().st_mtime < cutoff:
+            marker = candidate.with_name(candidate.name + ".lease")
+            if (
+                candidate.is_file()
+                and candidate.suffix != ".lease"
+                and (marker.stat().st_mtime if marker.is_file() else candidate.stat().st_mtime)
+                < cutoff
+            ):
                 candidate.unlink()
+                marker.unlink(missing_ok=True)
         except OSError:
             pass
     return destination
@@ -232,13 +252,15 @@ def stage_for_ui(
         f"{identity}_{path.name}" if preserve_name else f"{identity}{suffix}"
     )
     if destination.is_file() and destination.stat().st_size == stat.st_size:
+        destination.with_name(destination.name + ".lease").touch()
         return str(destination.resolve())
+    destination.with_name(destination.name + ".lease").touch()
     try:
         os.link(path, destination)
     except FileExistsError:
         pass
     except OSError:
-        temporary = destination.with_name(f".{destination.name}.tmp")
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
         try:
             shutil.copy2(path, temporary)
             temporary.replace(destination)
@@ -353,6 +375,7 @@ def view(project: DubProject, project_dir: Path, status: str) -> ProjectView:
         ),
         diagnostics=diagnostics(project),
         status=status,
+        revision=project.revision,
     )
 
 
@@ -545,6 +568,9 @@ def mix(
     project, directory = pipeline.reload_project(project_path)
     apply_table(project, table)
     pipeline.mix_project(project, directory, progress=progress, cancel_event=cancel_event)
+    # Render the state that was actually persisted by the pipeline.  This also
+    # makes an immediate result identical to reopening the same project.
+    project, directory = pipeline.reload_project(project_path)
     mode_label = {
         "mixed": "混音成品",
         "stem": "中文克隆音轨",
@@ -614,10 +640,21 @@ def apply_global_settings(project_path: str, settings: UserSettings) -> ProjectV
     )
     asr_changed = bool(_ASR_AFFECTING_SETTINGS.intersection(changed_fields))
     if changed_fields:
-        project.chinese_stem_file = None
-        project.output_file = None
-        project.output_video_file = None
-        project.subtitle_video_file = None
+        affects_audio = any(
+            name.startswith(("tts_", "chinese_", "mix_"))
+            or name
+            in {
+                "normalize_chinese_loudness",
+                "match_source_loudness",
+                "random_seed",
+                "reference_padding_seconds",
+            }
+            for name in changed_fields
+        )
+        affects_subtitles = affects_audio or any(
+            name.startswith("subtitle_") for name in changed_fields
+        )
+        invalidate_outputs(project, audio=affects_audio, subtitles=affects_subtitles)
     if asr_changed and project.sentences:
         # Keep the user's current table visible until they explicitly rerun
         # recognition, but never present it as matching the new configuration.
@@ -670,7 +707,9 @@ def recent_projects(projects_root: str | None = None) -> list[tuple[str, str]]:
     ]
 
 
-def reference_picker(project_path: str) -> tuple[list[tuple[str, str]], str | None, str | None]:
+def reference_picker(
+    project_path: str, *, include_preview: bool = True
+) -> tuple[list[tuple[str, str]], str | None, str | None]:
     """Return project sentence choices and a staged preview for the selected anchor."""
 
     project, directory = pipeline.reload_project(project_path)
@@ -696,7 +735,11 @@ def reference_picker(project_path: str) -> tuple[list[tuple[str, str]], str | No
     valid_ids = {value for _, value in choices}
     if selected not in valid_ids:
         selected = choices[0][1]
-    return choices, selected, reference_preview(project, directory, selected)
+    return (
+        choices,
+        selected,
+        reference_preview(project, directory, selected) if include_preview else None,
+    )
 
 
 def reference_preview(
@@ -743,6 +786,7 @@ def select_reference(project_path: str, sentence_id: str) -> tuple[str, str | No
     if not any(item.id == sentence_id for item in project.sentences):
         raise ProjectError(f"项目中找不到参考句：{sentence_id}")
     project.settings.tts_reference_sentence_id = sentence_id
+    invalidate_outputs(project)
     save_project(project, directory)
     return (
         f"已把 {sentence_id} 设为项目统一音色参考。",
@@ -761,7 +805,7 @@ def select_autoflow_project_reference(
         raise ProjectError(f"项目中找不到参考句：{sentence_id}")
     project.settings.tts_reference_source = "project_sentence"
     project.settings.tts_reference_sentence_id = sentence_id
-    if project.settings.tts_backend == "indextts2":
+    if project.settings.tts_backend in {"indextts2_5", "indextts2"}:
         project.settings.tts_index_speaker_source = "project_reference"
     save_project(project, directory)
     return (
@@ -788,7 +832,7 @@ def select_autoflow_external_reference(
     project.settings.tts_external_reference_text = str(text or "").strip()
     project.settings.tts_external_reference_language = cast(Any, language)
     project.settings.tts_reference_sentence_id = None
-    if project.settings.tts_backend == "indextts2":
+    if project.settings.tts_backend in {"indextts2_5", "indextts2"}:
         project.settings.tts_index_speaker_source = "external"
     save_project(project, directory)
     return f"已为当前批量任务导入外部参考音频：{stored.name}", str(stored)
